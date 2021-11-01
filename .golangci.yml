@@ -1,0 +1,45 @@
+run:
+  deadline: 5m
+linters:
+  disable-all: true
+  enable:
+    - bodyclose
+    - deadcode
+    - dupl
+    - dogsled
+    - durationcheck
+    - errcheck
+    - errname
+    - goconst
+    - gocognit
+    - gocritic
+    - gocyclo
+    - gofmt
+    - goimports
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - lll
+    - makezero
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck
+    - structcheck
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
+    - varcheck
+    - vet
+    - whitespace
+linters-settings:
+  gocognit:
+    min-complexity: 20
+  gocyclo:
+    min-complexity: 20
+  lll:
+    line-length: 130
+  dupl:
+    threshold: 340
