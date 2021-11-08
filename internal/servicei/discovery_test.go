@@ -53,6 +53,7 @@ func TestConsulDiscovery_Register(t *testing.T) {
 			args: args{
 				rs: ConvertToRS(config.Server{
 					ID:       "123",
+					Address:  "127.0.0.1",
 					Port:     8080,
 					TypeNode: "worker",
 				}, "ns"),
@@ -60,9 +61,19 @@ func TestConsulDiscovery_Register(t *testing.T) {
 			panic: false,
 		},
 		{
-			name: "Namespace empty",
+			name: "GraphID empty",
 			args: args{
 				rs: ConvertToRS(config.Server{}, ""),
+			},
+			panic: true,
+		},
+		{
+			name: "Address equal is empty",
+			args: args{
+				rs: ConvertToRS(config.Server{
+					Address: "",
+					Port:    2020,
+				}, "gi"),
 			},
 			panic: true,
 		},
@@ -70,8 +81,9 @@ func TestConsulDiscovery_Register(t *testing.T) {
 			name: "Port equal to zero",
 			args: args{
 				rs: ConvertToRS(config.Server{
-					Port: 0,
-				}, "ns"),
+					Address: "127.0.0.1",
+					Port:    0,
+				}, "gi"),
 			},
 			panic: true,
 		},
@@ -89,7 +101,7 @@ func TestConsulDiscovery_Register(t *testing.T) {
 				assert.Equal(t, tt.args.rs.ID, rs.ID, "ID")
 				assert.Equal(t, tt.args.rs.Port, rs.Port, "Port")
 				assert.Equal(t, tt.args.rs.TypeNode, rs.Tags[0], "TypeNode")
-				assert.Equal(t, tt.args.rs.Namespace, rs.Service, "Namespace")
+				assert.Equal(t, tt.args.rs.GraphID, rs.Service, "GraphID")
 			}
 		})
 	}
@@ -103,11 +115,11 @@ func TestConsulDiscovery_Deregister(t *testing.T) {
 	d := testNewConsulDiscovery(c)
 
 	rs := RegisterService{
-		ID:        "123",
-		Namespace: "ns",
-		TypeNode:  "worker",
-		Address:   "192.168.100.1",
-		Port:      8080,
+		ID:       "123",
+		GraphID:  "ns",
+		TypeNode: "worker",
+		Address:  "192.168.100.1",
+		Port:     8080,
 	}
 	d.Register(rs)
 	d.Deregister(rs.ID)

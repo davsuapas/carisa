@@ -34,8 +34,7 @@ func init() {
 }
 
 type Config struct {
-	// It is the isolation unit where a worker is located.
-	Namespace string `json:"namespace,omitempty"`
+	GraphID string `json:"graphID,omitempty"`
 	config.Common
 }
 
@@ -62,8 +61,8 @@ func FactoryBuild() *Factory {
 	}
 
 	confg := Config{
-		Namespace: "",
-		Common:    config.Default("worker"),
+		GraphID: "",
+		Common:  config.Default("worker"),
 	}
 	if err := configp.Read(file, ref, &confg); err != nil {
 		panic(err)

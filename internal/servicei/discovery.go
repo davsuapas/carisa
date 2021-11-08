@@ -25,11 +25,11 @@ import (
 
 // RegisterService is the register information
 type RegisterService struct {
-	ID        string
-	Namespace string
-	TypeNode  string
-	Address   string
-	Port      int
+	ID       string
+	GraphID  string
+	TypeNode string
+	Address  string
+	Port     int
 }
 
 // Discovery is the general register service
@@ -63,35 +63,41 @@ func NewConsulDiscovery(log *zap.Logger, config config.Discovery) *ConsulDiscove
 func (d *ConsulDiscovery) Register(rs RegisterService) {
 	d.log.Info("Registering server in consul ...", zap.String("ID", rs.ID))
 
-	if len(rs.Namespace) == 0 {
+	if len(rs.GraphID) == 0 {
 		d.log.Panic(
-			"The Namespace cannot be empty",
+			"The GraphID cannot be empty",
 			zap.String("ID", rs.ID),
 			zap.String("Address", rs.Address))
 	}
-	if rs.Port == 0 {
+	if len(rs.Address) == 0 || rs.Port == 0 {
 		d.log.Panic(
-			"The port cannot be zero",
+			"The address and port cannot be empty",
 			zap.String("ID", rs.ID),
-			zap.String("Address", rs.Address))
+			zap.String("Address", rs.Address),
+			zap.Int("Port", rs.Port))
 	}
 	sr := &api.AgentServiceRegistration{
 		ID:      rs.ID,
-		Name:    rs.Namespace,
+		Name:    rs.GraphID,
 		Tags:    []string{rs.TypeNode},
 		Port:    rs.Port,
 		Address: rs.Address,
 	}
 	if err := d.client.Agent().ServiceRegister(sr); err != nil {
-		d.log.Panic("The consul discovery client cannot register the worker agent",
-			zap.String("Namespace", rs.Namespace),
+		d.log.Panic(
+			"The consul discovery client cannot register the worker agent",
+			zap.String("Namespace", rs.GraphID),
 			zap.String("ID", rs.ID),
 			zap.String("Address", rs.Address),
 			zap.Int("Port", rs.Port),
 			zap.String("Error", err.Error()))
 	}
 
-	d.log.Info("Service registered in consul", zap.String("ID", rs.ID))
+	d.log.Info(
+		"Service registered in consul",
+		zap.String("ID", rs.ID),
+		zap.String("Address", rs.Address),
+		zap.Int("Port", rs.Port))
 }
 
 // Deregister unregister the worker agent
@@ -108,12 +114,12 @@ func (d *ConsulDiscovery) Deregister(id string) {
 }
 
 // ConvertTo converts from common config to RegisterService
-func ConvertToRS(c config.Server, ns string) RegisterService {
+func ConvertToRS(c config.Server, gi string) RegisterService {
 	return RegisterService{
-		ID:        c.ID,
-		Namespace: ns,
-		TypeNode:  c.TypeNode,
-		Address:   c.Address,
-		Port:      c.Port,
+		ID:       c.ID,
+		GraphID:  gi,
+		TypeNode: c.TypeNode,
+		Address:  c.Address,
+		Port:     c.Port,
 	}
 }

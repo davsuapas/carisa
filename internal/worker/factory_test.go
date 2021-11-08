@@ -40,11 +40,11 @@ func TestFactoryBuild(t *testing.T) {
 			action: func() {
 				os.Unsetenv(ev)
 				os.Setenv(ev, `{
-					"namespace": "ns"
+					"graphID": "gi"
 				}`)
 			},
 			ec: Config{
-				Namespace: "ns",
+				GraphID: "gi",
 				Common: config.Common{
 					Zap: config.Zap{
 						Development: true,
@@ -62,7 +62,7 @@ func TestFactoryBuild(t *testing.T) {
 			action: func() {
 				os.Unsetenv(ev)
 				os.Setenv(ev, `{
-					"namespace": "errror_ns",
+					"graphID": "errror_gi",
 				}`)
 			},
 			panic: true,
@@ -78,7 +78,7 @@ func TestFactoryBuild(t *testing.T) {
 				return
 			}
 			f := FactoryBuild()
-			assert.Equal(t, tt.ec.Namespace, f.config.Namespace, "Namespace")
+			assert.Equal(t, tt.ec.GraphID, f.config.GraphID, "graphID")
 			assert.Equal(t, tt.ec.Zap, f.config.Zap, "Zap")
 			assert.Equal(t, tt.ec.Discovery, f.config.Discovery, "Discovery")
 			assert.NotNil(t, f.discovery, "Discovery")

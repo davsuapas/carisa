@@ -32,10 +32,11 @@ func Start(factory *Factory) {
 		factory.log.Info(
 			"Starting worker agent ...",
 			zap.String("ID", factory.config.Server.ID),
-			zap.String("Address", factory.config.Server.Address))
+			zap.String("Address", factory.config.Server.Address),
+			zap.Int("Port", factory.config.Server.Port))
 
 		factory.discovery.Register(
-			servicei.ConvertToRS(factory.config.Server, factory.config.Namespace))
+			servicei.ConvertToRS(factory.config.Server, factory.config.GraphID))
 
 		factory.log.Info("Worker agent started")
 	}()
