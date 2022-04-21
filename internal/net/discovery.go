@@ -15,26 +15,31 @@
  *   limitations under the License.
  */
 
-package servicei
+package net
 
 import (
+	"log"
+	"strconv"
+
 	"github.com/carisa/internal/config"
 	"github.com/hashicorp/consul/api"
 	"go.uber.org/zap"
 )
 
-// RegisterService is the register information
-type RegisterService struct {
-	ID       string
-	GraphID  string
-	TypeNode string
-	Address  string
-	Port     int
+// HealthAddress returns the health address
+func HealthAddress(srv config.Server, health config.Health) string {
+	if len(srv.Address) == 0 || health.Port == 0 {
+		log.Panic("The server and port for health service cannot be empty")
+	}
+
+	return srv.Address + ":" + strconv.Itoa(health.Port)
 }
 
 // Discovery is the general register service
 type Discovery interface {
-	Register(rs RegisterService)
+	// Register registers a service into discovery service
+	Register(srv config.Server, health config.Health, name string)
+	// DeRegister deregisters a service into discovery service
 	Deregister(id string)
 }
 
@@ -44,10 +49,10 @@ type ConsulDiscovery struct {
 }
 
 // NewConsulDiscovery creates the consul discovery service
-func NewConsulDiscovery(log *zap.Logger, config config.Discovery) *ConsulDiscovery {
+func NewConsulDiscovery(log *zap.Logger, srv string) *ConsulDiscovery {
 	cConsul := api.DefaultConfig()
-	if len(config.Server) > 0 {
-		cConsul.Address = config.Server
+	if len(srv) > 0 {
+		cConsul.Address = srv
 	}
 	client, err := api.NewClient(cConsul)
 	if err != nil {
@@ -60,44 +65,54 @@ func NewConsulDiscovery(log *zap.Logger, config config.Discovery) *ConsulDiscove
 }
 
 // Register registers a service into consul
-func (d *ConsulDiscovery) Register(rs RegisterService) {
-	d.log.Info("Registering server in consul ...", zap.String("ID", rs.ID))
+func (d *ConsulDiscovery) Register(srv config.Server, health config.Health, name string) {
+	d.log.Info("Registering server in consul ...", zap.String("ID", srv.ID))
 
-	if len(rs.GraphID) == 0 {
+	if len(name) == 0 {
 		d.log.Panic(
-			"The GraphID cannot be empty",
-			zap.String("ID", rs.ID),
-			zap.String("Address", rs.Address))
+			"The name cannot be empty",
+			zap.String("ID", srv.ID),
+			zap.String("Address", srv.Address))
 	}
-	if len(rs.Address) == 0 || rs.Port == 0 {
+	if len(srv.Address) == 0 || srv.Port == 0 {
 		d.log.Panic(
 			"The address and port cannot be empty",
-			zap.String("ID", rs.ID),
-			zap.String("Address", rs.Address),
-			zap.Int("Port", rs.Port))
+			zap.String("ID", srv.ID),
+			zap.String("Address", srv.Address),
+			zap.Int("Port", srv.Port))
+	}
+
+	check := &api.AgentServiceCheck{
+		Name:                           srv.ID,
+		Interval:                       strconv.Itoa(health.Interval) + "s",
+		Timeout:                        strconv.Itoa(health.Timeout) + "s",
+		TCP:                            HealthAddress(srv, health),
+		FailuresBeforeCritical:         health.FailuresBeforeCritical,
+		DeregisterCriticalServiceAfter: strconv.Itoa(health.Timeout) + "m",
 	}
 	sr := &api.AgentServiceRegistration{
-		ID:      rs.ID,
-		Name:    rs.GraphID,
-		Tags:    []string{rs.TypeNode},
-		Port:    rs.Port,
-		Address: rs.Address,
+		ID:      srv.ID,
+		Name:    name,
+		Tags:    []string{string(srv.NodeType)},
+		Port:    srv.Port,
+		Address: srv.Address,
+		Check:   check,
 	}
 	if err := d.client.Agent().ServiceRegister(sr); err != nil {
 		d.log.Panic(
-			"The consul discovery client cannot register the worker agent",
-			zap.String("Namespace", rs.GraphID),
-			zap.String("ID", rs.ID),
-			zap.String("Address", rs.Address),
-			zap.Int("Port", rs.Port),
+			"The consul discovery client cannot register the agent",
+			zap.String("Namespace", name),
+			zap.String("ID", srv.ID),
+			zap.String("Address", srv.Address),
+			zap.Int("Port", srv.Port),
 			zap.String("Error", err.Error()))
 	}
 
 	d.log.Info(
 		"Service registered in consul",
-		zap.String("ID", rs.ID),
-		zap.String("Address", rs.Address),
-		zap.Int("Port", rs.Port))
+		zap.String("ID", srv.ID),
+		zap.String("Address", srv.Address),
+		zap.Int("Port", srv.Port))
 }
 
 // Deregister unregister the worker agent
@@ -111,15 +126,4 @@ func (d *ConsulDiscovery) Deregister(id string) {
 	}
 
 	d.log.Info("Service de-registered in consul", zap.String("ID", id))
-}
-
-// ConvertTo converts from common config to RegisterService
-func ConvertToRS(c config.Server, gi string) RegisterService {
-	return RegisterService{
-		ID:       c.ID,
-		GraphID:  gi,
-		TypeNode: c.TypeNode,
-		Address:  c.Address,
-		Port:     c.Port,
-	}
 }

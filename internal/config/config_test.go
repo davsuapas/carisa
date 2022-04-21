@@ -25,13 +25,59 @@ import (
 )
 
 func TestDefault(t *testing.T) {
-	z := Zap{
-		Development: true,
-		Level:       zapcore.DebugLevel,
-		Encoding:    "console",
+	type args struct {
+		typeNode NodeType
+		port     int
+		res      Common
 	}
-	c := Default("typeNode")
-
-	assert.Equal(t, z, c.Zap, "Logger")
-	assert.Equal(t, "typeNode", c.TypeNode, "TypeNode")
+	tests := []struct {
+		name string
+		args args
+		res  Common
+	}{
+		{
+			name: "Default with port equal to 0",
+			args: args{
+				typeNode: Worker,
+				port:     0,
+			},
+			res: Common{
+				Zap: Zap{
+					Development: true,
+					Level:       zapcore.DebugLevel,
+					Encoding:    "console",
+				},
+				Discovery: DefaultDiscovery(62422 + 1),
+				Server: Server{
+					Port: 62422,
+				},
+			},
+		},
+		{
+			name: "Default with port configured",
+			args: args{
+				typeNode: Master,
+				port:     3030,
+			},
+			res: Common{
+				Zap: Zap{
+					Development: true,
+					Level:       zapcore.DebugLevel,
+					Encoding:    "console",
+				},
+				Discovery: DefaultDiscovery(3030 + 1),
+				Server: Server{
+					Port: 3030,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := Default(tt.args.typeNode, tt.args.port)
+			assert.Equal(t, tt.res.Zap, d.Zap, "Zap")
+			assert.Equal(t, tt.res.Discovery, d.Discovery, "Discovery")
+			assert.Equal(t, tt.res.Port, d.Server.Port, "Port")
+		})
+	}
 }

@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2021 CARISA
+ *   Copyright (c) 2022 CARISA
  *   All rights reserved.
 
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
  *   limitations under the License.
  */
 
-package worker
+package master
 
 import (
 	"os"
@@ -26,7 +26,7 @@ import (
 )
 
 func TestFactoryBuild(t *testing.T) {
-	const ev = "CARISA_WORKER_CONFIG_JSON"
+	const ev = "CARISA_MASTER_CONFIG_JSON"
 
 	tests := []struct {
 		name   string
@@ -39,12 +39,11 @@ func TestFactoryBuild(t *testing.T) {
 			action: func() {
 				os.Unsetenv(ev)
 				os.Setenv(ev, `{
-					"graphID": "gi"
+					"server": {"id": "id"}
 				}`)
 			},
 			ec: Config{
-				GraphID: "gi",
-				Common:  config.Default(config.Worker, 0),
+				Common: config.Default(config.Master, MasterPort),
 			},
 			panic: false,
 		},
@@ -53,7 +52,7 @@ func TestFactoryBuild(t *testing.T) {
 			action: func() {
 				os.Unsetenv(ev)
 				os.Setenv(ev, `{
-					"graphID": "errror_gi",
+					"server": {"id": "id"
 				}`)
 			},
 			panic: true,
@@ -69,11 +68,11 @@ func TestFactoryBuild(t *testing.T) {
 				return
 			}
 			f := FactoryBuild("")
-			assert.Equal(t, tt.ec.GraphID, f.config.GraphID, "graphID")
 			tt.ec.Common.ID = f.config.Common.ID
 			assert.Equal(t, tt.ec.Common, f.config.Common, "Common")
+			assert.Equal(t, "id", f.config.Server.ID, "Server ID")
 			assert.NotNil(t, f.discovery, "Discovery")
-			assert.NotNil(t, f.health, "Health")
+			assert.NotNil(t, f.health, "Discovery")
 			assert.NotNil(t, f.log, "Logger")
 		})
 	}

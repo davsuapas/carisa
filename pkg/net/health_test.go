@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2021 CARISA
+ *   Copyright (c) 2022 CARISA
  *   All rights reserved.
 
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,19 +15,25 @@
  *   limitations under the License.
  */
 
-package main
+package net
 
 import (
-	"flag"
+	"net"
+	"testing"
 
-	"github.com/carisa/internal/worker"
+	"github.com/carisa/pkg/log"
+	"github.com/stretchr/testify/assert"
 )
 
-func main() {
-	var confgFile string
-	flag.StringVar(&confgFile, "config", "", "the worker config json file")
+func TestTCPHealth_NewTCPHealth_Panic_Bad_Address(t *testing.T) {
+	assert.Panics(t, func() { NewTCPHealth(log.TestLogger(), "5:5050") })
+}
 
-	flag.Parse()
-
-	worker.Start(worker.FactoryBuild(confgFile))
+func TestTCPHealth_Run(t *testing.T) {
+	health := NewTCPHealth(log.TestLogger(), "localhost:5050")
+	health.Run()
+	client, err := net.Dial("tcp", "localhost:5050")
+	assert.Nil(t, err)
+	client.Close()
+	health.Stop()
 }

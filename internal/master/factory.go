@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2021 CARISA
+ *   Copyright (c) 2022 CARISA
  *   All rights reserved.
 
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
  *   limitations under the License.
  */
 
-package worker
+package master
 
 import (
 	"encoding/json"
@@ -28,7 +28,6 @@ import (
 )
 
 type Config struct {
-	GraphID string `json:"graphID,omitempty"`
 	config.Common
 }
 
@@ -37,7 +36,7 @@ func (c *Config) ToString() string {
 	return string(r)
 }
 
-// Factory is the worker controller
+// Factory is the master controller
 type Factory struct {
 	config    Config
 	discovery net.Discovery
@@ -45,10 +44,12 @@ type Factory struct {
 	log       *zap.Logger
 }
 
-// Build builds worker factory
+const MasterPort int = 52422
+
+// Build builds master factory
 func FactoryBuild(configFile string) *Factory {
 	file := false
-	ref := "CARISA_WORKER_CONFIG_JSON"
+	ref := "CARISA_MASTER_CONFIG_JSON"
 
 	if len(configFile) > 0 {
 		file = true
@@ -56,8 +57,7 @@ func FactoryBuild(configFile string) *Factory {
 	}
 
 	cnf := Config{
-		GraphID: "",
-		Common:  config.Default(config.Worker, 0),
+		Common: config.Default(config.Master, MasterPort),
 	}
 	if err := configp.Read(file, ref, &cnf); err != nil {
 		panic(err)
@@ -65,7 +65,7 @@ func FactoryBuild(configFile string) *Factory {
 
 	log := config.NewLogger(cnf.Common.Zap)
 
-	log.Info("Loading worker configuration", zap.String("Source", ref), zap.String("Config", cnf.ToString()))
+	log.Info("Loading master configuration", zap.String("Source", ref), zap.String("Config", cnf.ToString()))
 
 	return &Factory{
 		config:    cnf,

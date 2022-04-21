@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2021 CARISA
+ *   Copyright (c) 2022 CARISA
  *   All rights reserved.
 
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,29 +15,30 @@
  *   limitations under the License.
  */
 
-package worker
+package master
 
 import (
 	"os"
 	"os/signal"
 
+	"github.com/carisa/internal/config"
 	"go.uber.org/zap"
 )
 
-// Start starts the worker server
+// Start starts the master server
 func Start(factory *Factory) {
 	// Start server
 	go func() {
 		factory.log.Info(
-			"Starting worker server ...",
+			"Starting master server ...",
 			zap.String("ID", factory.config.Server.ID),
 			zap.String("Address", factory.config.Server.Address),
 			zap.Int("Port", factory.config.Server.Port))
 
 		factory.health.Run()
-		factory.discovery.Register(factory.config.Server, factory.config.Health, factory.config.GraphID)
+		factory.discovery.Register(factory.config.Server, factory.config.Health, string(config.Master))
 
-		factory.log.Info("Worker server started")
+		factory.log.Info("Master server started")
 	}()
 
 	// Wait for interrupt signal to gracefully shutdown the server
@@ -46,12 +47,12 @@ func Start(factory *Factory) {
 	<-quit
 
 	factory.log.Info(
-		"Stopping worker server ...",
+		"Stopping master server ...",
 		zap.String("ID", factory.config.Server.ID),
 		zap.String("Address", factory.config.Server.Address))
 
 	factory.discovery.Deregister(factory.config.Server.ID)
 	factory.health.Stop()
 
-	factory.log.Info("Worker server stopped")
+	factory.log.Info("Master server stopped")
 }

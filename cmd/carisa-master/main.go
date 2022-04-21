@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2021 CARISA
+ *   Copyright (c) 2022 CARISA
  *   All rights reserved.
 
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,14 +20,14 @@ package main
 import (
 	"flag"
 
-	"github.com/carisa/internal/worker"
+	"github.com/carisa/internal/master"
 )
 
 func main() {
 	var confgFile string
-	flag.StringVar(&confgFile, "config", "", "the worker config json file")
+	flag.StringVar(&confgFile, "config", "", "the master config json file")
 
 	flag.Parse()
 
-	worker.Start(worker.FactoryBuild(confgFile))
+	master.Start(master.FactoryBuild(confgFile))
 }

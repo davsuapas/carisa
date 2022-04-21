@@ -15,20 +15,76 @@
  *   limitations under the License.
  */
 
-package servicei
+package net
 
 import (
 	"testing"
 
 	"github.com/carisa/internal/config"
+	"github.com/carisa/pkg/log"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/serf/testutil/retry"
 	"github.com/stretchr/testify/assert"
 )
 
+func TestHealthAddress(t *testing.T) {
+	type args struct {
+		srv    config.Server
+		health config.Health
+	}
+	tests := []struct {
+		name  string
+		args  args
+		panic bool
+	}{
+		{
+			name: "Server address",
+			args: args{
+				srv: config.Server{
+					Address: "srv",
+				},
+				health: config.Health{
+					Port: 8080,
+				},
+			},
+			panic: false,
+		},
+		{
+			name: "Server name is empty",
+			args: args{
+				srv: config.Server{},
+				health: config.Health{
+					Port: 8080,
+				},
+			},
+			panic: true,
+		},
+		{
+			name: "Port is equal Zero",
+			args: args{
+				srv: config.Server{
+					Address: "srv",
+				},
+				health: config.Health{},
+			},
+			panic: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.panic {
+				assert.Panics(t, func() { HealthAddress(tt.args.srv, tt.args.health) }, "Panics")
+				return
+			}
+			address := HealthAddress(tt.args.srv, tt.args.health)
+			assert.Equal(t, "srv:8080", address, "Server address")
+		})
+	}
+}
+
 func TestNewConsulDiscovery(t *testing.T) {
-	d := NewConsulDiscovery(config.TestLogger(), config.DefaultDiscovery())
+	d := NewConsulDiscovery(log.TestLogger(), "")
 	assert.NotNil(t, d.log, "Logger")
 	assert.NotNil(t, d.client, "Consul client")
 }
@@ -36,12 +92,15 @@ func TestNewConsulDiscovery(t *testing.T) {
 func TestConsulDiscovery_Register(t *testing.T) {
 	t.Parallel()
 
+	ch := newConfigHealth()
 	c, s := testConsulServer(t)
 	defer closecs(s)
 	d := testNewConsulDiscovery(c)
 
 	type args struct {
-		rs RegisterService
+		srv   config.Server
+		healh config.Health
+		name  string
 	}
 	tests := []struct {
 		name  string
@@ -51,39 +110,46 @@ func TestConsulDiscovery_Register(t *testing.T) {
 		{
 			name: "Register a service",
 			args: args{
-				rs: ConvertToRS(config.Server{
+				srv: config.Server{
 					ID:       "123",
 					Address:  "127.0.0.1",
 					Port:     8080,
-					TypeNode: "worker",
-				}, "ns"),
+					NodeType: config.Worker,
+				},
+				healh: ch,
+				name:  "ns",
 			},
 			panic: false,
 		},
 		{
 			name: "GraphID empty",
 			args: args{
-				rs: ConvertToRS(config.Server{}, ""),
+				srv:   config.Server{},
+				healh: newConfigHealth(),
+				name:  "",
 			},
 			panic: true,
 		},
 		{
-			name: "Address equal is empty",
+			name: "Address equal to empty",
 			args: args{
-				rs: ConvertToRS(config.Server{
-					Address: "",
-					Port:    2020,
-				}, "gi"),
+				srv:   config.Server{},
+				healh: newConfigHealth(),
+				name:  "",
 			},
 			panic: true,
 		},
 		{
 			name: "Port equal to zero",
 			args: args{
-				rs: ConvertToRS(config.Server{
-					Address: "127.0.0.1",
-					Port:    0,
-				}, "gi"),
+				srv: config.Server{
+					ID:       "123",
+					Address:  "127.0.0.1",
+					Port:     0,
+					NodeType: config.Worker,
+				},
+				healh: ch,
+				name:  "gi",
 			},
 			panic: true,
 		},
@@ -91,17 +157,17 @@ func TestConsulDiscovery_Register(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.panic {
-				assert.Panics(t, func() { d.Register(tt.args.rs) }, "Panics")
+				assert.Panics(t, func() { d.Register(tt.args.srv, tt.args.healh, tt.args.name) }, "Panics")
 				return
 			}
 
-			d.Register(tt.args.rs)
-			rs, _, err := c.Agent().Service(tt.args.rs.ID, &api.QueryOptions{})
+			d.Register(tt.args.srv, tt.args.healh, tt.args.name)
+			rs, _, err := c.Agent().Service(tt.args.srv.ID, &api.QueryOptions{})
 			if assert.NoError(t, err, "Error getting service info") {
-				assert.Equal(t, tt.args.rs.ID, rs.ID, "ID")
-				assert.Equal(t, tt.args.rs.Port, rs.Port, "Port")
-				assert.Equal(t, tt.args.rs.TypeNode, rs.Tags[0], "TypeNode")
-				assert.Equal(t, tt.args.rs.GraphID, rs.Service, "GraphID")
+				assert.Equal(t, tt.args.srv.ID, rs.ID, "ID")
+				assert.Equal(t, tt.args.srv.Port, rs.Port, "Port")
+				assert.Equal(t, tt.args.srv.NodeType, config.NodeType(rs.Tags[0]), "TypeNode")
+				assert.Equal(t, tt.args.name, rs.Service, "GraphID")
 			}
 		})
 	}
@@ -114,16 +180,16 @@ func TestConsulDiscovery_Deregister(t *testing.T) {
 	defer closecs(s)
 	d := testNewConsulDiscovery(c)
 
-	rs := RegisterService{
+	srv := config.Server{
 		ID:       "123",
-		GraphID:  "ns",
-		TypeNode: "worker",
 		Address:  "192.168.100.1",
 		Port:     8080,
+		NodeType: config.Worker,
 	}
-	d.Register(rs)
-	d.Deregister(rs.ID)
-	_, _, err := c.Agent().Service(rs.ID, &api.QueryOptions{})
+
+	d.Register(srv, newConfigHealth(), "ns")
+	d.Deregister(srv.ID)
+	_, _, err := c.Agent().Service(srv.ID, &api.QueryOptions{})
 	assert.Contains(t, err.Error(), "404")
 }
 
@@ -163,9 +229,19 @@ func testConsulServer(t *testing.T) (*api.Client, *testutil.TestServer) {
 	return client, server
 }
 
+func newConfigHealth() config.Health {
+	return config.Health{
+		Interval:                       60,
+		Timeout:                        1,
+		FailuresBeforeCritical:         10,
+		DeregisterCriticalServiceAfter: 1,
+		Port:                           5050,
+	}
+}
+
 func testNewConsulDiscovery(c *api.Client) Discovery {
 	return &ConsulDiscovery{
-		log:    config.TestLogger(),
+		log:    log.TestLogger(),
 		client: c,
 	}
 }
