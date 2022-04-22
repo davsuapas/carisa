@@ -26,7 +26,7 @@ type NodeType string
 
 const (
 	Master NodeType = "master"
-	Worker          = "worker"
+	Worker NodeType = "worker"
 )
 
 // Zap defines the configuration for log framework

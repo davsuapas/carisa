@@ -28,7 +28,6 @@ func TestDefault(t *testing.T) {
 	type args struct {
 		typeNode NodeType
 		port     int
-		res      Common
 	}
 	tests := []struct {
 		name string
