@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+members = ["carisa/providers"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = ["David Suárez Pascual <dav.sua.pas@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/davsuapas/carisa"
+
+[package]
+name = "carisa"
+description = "Build modular, scalable agent applications powered by Temporal to ensure fault-tolerance, execution guarantees, and a delightful, visible development experience for mission-critical workloads."
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[profile.dev]
+debug = 1
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace.lints.rust]
+future-incompatible = { level = "warn" }
+warnings = { level = "deny" }
+keyword-idents = { level = "deny" }
+let-underscore = { level = "deny" }
+nonstandard-style = { level = "deny" }
+refining-impl-trait = { level = "deny" }
+unused = { level = "deny" }
+
+# Individuales allow-by-default
+missing_docs = { level = "deny" }
+missing_debug_implementations = { level = "warn" }
+unsafe_code = { level = "deny" }
+unsafe_op_in_unsafe_fn = { level = "deny" }
+unreachable_pub = { level = "warn" }
+unnameable_types = { level = "warn" }
+unused_lifetimes = { level = "warn" }
+unused_import_braces = { level = "warn" }
+unused_macro_rules = { level = "warn" }
+redundant_lifetimes = { level = "warn" }
+redundant_imports = { level = "warn" }
+trivial_casts = { level = "warn" }
+trivial_numeric_casts = { level = "warn" }
+unit_bindings = { level = "warn" }
+single_use_lifetimes = { level = "warn" }
+explicit_outlives_requirements = { level = "warn" }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = { level = "deny" }
+private_intra_doc_links = { level = "deny" }
+missing_crate_level_docs = { level = "deny" }
+invalid_html_tags = { level = "deny" }
+invalid_rust_codeblocks = { level = "deny" }
+bare_urls = { level = "deny" }
+unescaped_backticks = { level = "deny" }
+redundant_explicit_links = { level = "deny" }
+
+[workspace.lints.clippy]
+all = { level = "deny" }
+pedantic = { level = "warn" }
+nursery = { level = "warn" }
+
+# Restriction
+unwrap_used = { level = "deny" }
+expect_used = { level = "warn" }
+panic = { level = "warn" }
+todo = { level = "deny" }
+unimplemented = { level = "deny" }
+indexing_slicing = { level = "warn" }
+tomldbg_macro = { level = "deny" }
+print_stdout = { level = "warn" }
+print_stderr = { level = "warn" }
+clone_on_ref_ptr = { level = "warn" }
+str_to_string = { level = "warn" }
+tomlundocumented_unsafe_blocks = { level = "deny" }
+allow_attributes = { level = "warn" }
+arithmetic_side_effects = { level = "warn" }
+cast_possible_truncation = { level = "warn" }
+cast_sign_loss = { level = "warn" }
+tomlelse_if_without_else = { level = "warn" }
+exhaustive_structs = { level = "warn" }
+exhaustive_enums = { level = "warn" }
+exit = { level = "deny" }
+
+[lints]
+workspace = true
