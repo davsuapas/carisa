@@ -1,0 +1,20 @@
+[package]
+name = "carisa-skill"
+description = ""
+authors = ["David Suárez Pascual <dav.sua.pas@gmail.com>"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+derive_builder = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "0.0.28"
+thiserror = "2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rstest = "0.26.1"

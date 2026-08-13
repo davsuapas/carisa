@@ -1,23 +1,14 @@
 [workspace]
-resolver = "2"
-members = ["carisa/providers"]
+resolver = "3"
+members = ["carisa/*"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-authors = ["David Suárez Pascual <dav.sua.pas@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/davsuapas/carisa"
 
-[package]
-name = "carisa"
-description = "Build modular, scalable agent applications powered by Temporal to ensure fault-tolerance, execution guarantees, and a delightful, visible development experience for mission-critical workloads."
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[dependencies]
+[workspace.dependencies]
 
 [profile.dev]
 debug = 1
@@ -37,7 +28,7 @@ keyword-idents = { level = "deny" }
 let-underscore = { level = "deny" }
 nonstandard-style = { level = "deny" }
 refining-impl-trait = { level = "deny" }
-unused = { level = "deny" }
+unused = { level = "deny", priority = -1 }
 
 # Individuales allow-by-default
 missing_docs = { level = "deny" }
@@ -68,9 +59,9 @@ unescaped_backticks = { level = "deny" }
 redundant_explicit_links = { level = "deny" }
 
 [workspace.lints.clippy]
-all = { level = "deny" }
-pedantic = { level = "warn" }
-nursery = { level = "warn" }
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
 
 # Restriction
 unwrap_used = { level = "deny" }
@@ -79,20 +70,18 @@ panic = { level = "warn" }
 todo = { level = "deny" }
 unimplemented = { level = "deny" }
 indexing_slicing = { level = "warn" }
-tomldbg_macro = { level = "deny" }
+dbg_macro = { level = "deny" }
 print_stdout = { level = "warn" }
 print_stderr = { level = "warn" }
 clone_on_ref_ptr = { level = "warn" }
 str_to_string = { level = "warn" }
-tomlundocumented_unsafe_blocks = { level = "deny" }
+undocumented_unsafe_blocks = { level = "deny" }
 allow_attributes = { level = "warn" }
 arithmetic_side_effects = { level = "warn" }
 cast_possible_truncation = { level = "warn" }
 cast_sign_loss = { level = "warn" }
-tomlelse_if_without_else = { level = "warn" }
+else_if_without_else = { level = "warn" }
 exhaustive_structs = { level = "warn" }
 exhaustive_enums = { level = "warn" }
 exit = { level = "deny" }
-
-[lints]
-workspace = true
+must_use_candidate = { level = "allow" }
