@@ -1,14 +1,20 @@
-[workspace]
-resolver = "3"
-members = ["carisa/*"]
-
-[workspace.package]
+[package]
+name = "carisa-core"
+description = ""
+authors = ["David Suárez Pascual <dav.sua.pas@gmail.com>"]
 version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/davsuapas/carisa"
 
-[workspace.dependencies]
+[dependencies]
+derive_builder = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "0.0.28"
+thiserror = "2"
+
+[dev-dependencies]
+rstest = "0.26.1"
 
 [profile.dev]
 debug = 1
@@ -21,7 +27,7 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-[workspace.lints.rust]
+[lints.rust]
 future-incompatible = { level = "warn" }
 warnings = { level = "deny" }
 keyword-idents = { level = "deny" }
@@ -48,7 +54,7 @@ unit_bindings = { level = "warn" }
 single_use_lifetimes = { level = "warn" }
 explicit_outlives_requirements = { level = "warn" }
 
-[workspace.lints.rustdoc]
+[lints.rustdoc]
 broken_intra_doc_links = { level = "deny" }
 private_intra_doc_links = { level = "deny" }
 missing_crate_level_docs = { level = "deny" }
@@ -58,7 +64,7 @@ bare_urls = { level = "deny" }
 unescaped_backticks = { level = "deny" }
 redundant_explicit_links = { level = "deny" }
 
-[workspace.lints.clippy]
+[lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
