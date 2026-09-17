@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{DomainSkill, LoadError, PlatformSkill};
+use crate::{DomainSkill, LoadSkillError, PlatformSkill};
 
 /// A resolved prompt payload ready to be injected into an agent context.
 ///
@@ -133,14 +133,14 @@ impl SkillManager {
   ///
   /// # Errors
   ///
-  /// Returns [`LoadError`] when the requested skill id does not exist in the
+  /// Returns [`LoadSkillError`] when the requested skill id does not exist in the
   /// registry.
-  fn load(&self, id: &str) -> Result<SkillPrompt, LoadError> {
+  fn load(&self, id: &str) -> Result<SkillPrompt, LoadSkillError> {
     self
       .skills
       .get(id)
       .cloned()
-      .ok_or_else(|| LoadError { id: id.to_owned() })
+      .ok_or_else(|| LoadSkillError { id: id.to_owned() })
   }
 }
 
@@ -268,7 +268,7 @@ mod tests {
     assert!(result.is_err());
     assert_eq!(
       result.unwrap_err(),
-      LoadError {
+      LoadSkillError {
         id: "no-existe".to_owned()
       }
     );

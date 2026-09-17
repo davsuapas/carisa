@@ -8,13 +8,22 @@ license = "MIT"
 repository = "https://github.com/davsuapas/carisa"
 
 [dependencies]
-derive_builder = "0.20"
-serde = { version = "1", features = ["derive"] }
-serde-saphyr = "0.0.28"
-thiserror = "2"
+async-trait = "0.1.92"
+derive_builder = "0.20.2"
+futures-util = "0.3.34"
+redis = { version = "1.7.0", features = ["tokio-comp", "connection-manager"] }
+rig-core = "0.42.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "1.2.0"
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+ulid = "3.0.0"
+zstd = "0.14"
 
 [dev-dependencies]
-rstest = "0.26.1"
+redis-test = { version = "1.0.4", features = ["aio"] }
+rstest = "0.27.0"
 
 [profile.dev]
 debug = 1

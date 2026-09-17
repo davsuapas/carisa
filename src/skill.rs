@@ -43,12 +43,11 @@
 //! ```
 
 pub mod error;
-mod manager;
+pub mod manager;
 pub mod markdown;
 pub mod types;
 
-pub use error::{LoadError, MarkdownError};
-pub use manager::SkillPrompt;
+pub use error::{LoadSkillError, MarkdownSkillError};
 pub use types::{
   DomainSkill, DomainSkillBuilder, PlatformSkill, PlatformSkillBuilder, Skill,
   SkillMetadata,

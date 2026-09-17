@@ -110,8 +110,5 @@ pub mod disable;
 pub mod filter;
 pub mod runtime;
 
-pub use builder::{
-  AgentBuilder, AgentBuilderFinal, AgentBuilderWithPlatform, AllGroupsBuilder,
-  DisableBuilder,
-};
+pub use builder::AgentBuilder;
 pub use runtime::AgentRuntime;

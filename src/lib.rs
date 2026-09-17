@@ -4,13 +4,13 @@
 //! by Carisa agents and orchestration layers.
 
 pub mod agent;
+pub mod memory;
 pub mod skill;
 
-pub use agent::{
-  AgentBuilder, AgentBuilderFinal, AgentBuilderWithPlatform, AgentRuntime,
-  AllGroupsBuilder, DisableBuilder,
-};
+pub use agent::builder::AgentBuilder;
+pub use agent::runtime::AgentRuntime;
+pub use memory::log;
 pub use skill::{
-  DomainSkill, DomainSkillBuilder, LoadError, MarkdownError, PlatformSkill,
-  PlatformSkillBuilder, Skill, SkillMetadata,
+  DomainSkill, DomainSkillBuilder, LoadSkillError, MarkdownSkillError,
+  PlatformSkill, PlatformSkillBuilder, Skill, SkillMetadata,
 };

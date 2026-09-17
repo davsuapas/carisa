@@ -12,7 +12,7 @@ use thiserror::Error;
 /// frontmatter has been partially parsed.
 #[derive(Error, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum MarkdownError {
+pub enum MarkdownSkillError {
   /// The YAML frontmatter contains invalid syntax.
   YamlParse {
     /// Skill id, if parsed before the error occurred.
@@ -48,7 +48,7 @@ pub enum MarkdownError {
   },
 }
 
-impl std::fmt::Display for MarkdownError {
+impl std::fmt::Display for MarkdownSkillError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       Self::YamlParse { id, title: _, msg } => {
@@ -95,7 +95,7 @@ impl std::fmt::Display for MarkdownError {
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[error("Skill '{id}' not found")]
-pub struct LoadError {
+pub struct LoadSkillError {
   /// The id that was requested but not found.
   pub id: String,
 }
@@ -109,7 +109,7 @@ mod tests {
     let bad_yaml = "[unclosed_seq";
     let yaml_err =
       serde_saphyr::from_str::<serde::de::IgnoredAny>(bad_yaml).unwrap_err();
-    let err = MarkdownError::YamlParse {
+    let err = MarkdownSkillError::YamlParse {
       id: Some("x".to_owned()),
       title: Some("T".to_owned()),
       msg: yaml_err.to_string(),
@@ -123,7 +123,7 @@ mod tests {
 
   #[test]
   fn missing_field_without_id_is_readable() {
-    let err = MarkdownError::MissingField {
+    let err = MarkdownSkillError::MissingField {
       id: None,
       title: None,
       field: "description".to_owned(),
@@ -142,7 +142,7 @@ mod tests {
 
   #[test]
   fn load_error_not_found_includes_id_in_display() {
-    let err = LoadError {
+    let err = LoadSkillError {
       id: "my-skill".to_owned(),
     };
     let msg = err.to_string();
@@ -157,7 +157,7 @@ mod tests {
     let bad_yaml = "[unclosed_seq";
     let yaml_err =
       serde_saphyr::from_str::<serde::de::IgnoredAny>(bad_yaml).unwrap_err();
-    let err = MarkdownError::YamlParse {
+    let err = MarkdownSkillError::YamlParse {
       id: None,
       title: None,
       msg: yaml_err.to_string(),
@@ -171,13 +171,13 @@ mod tests {
 
   #[test]
   fn empty_body_format() {
-    let with_id = MarkdownError::EmptyBody {
+    let with_id = MarkdownSkillError::EmptyBody {
       id: Some("x".to_owned()),
       title: None,
     };
     assert!(with_id.to_string().contains("Skill 'x'"));
 
-    let without_id = MarkdownError::EmptyBody {
+    let without_id = MarkdownSkillError::EmptyBody {
       id: None,
       title: None,
     };
@@ -186,7 +186,7 @@ mod tests {
 
   #[test]
   fn invalid_delimiters_format() {
-    let err = MarkdownError::InvalidDelimiters {
+    let err = MarkdownSkillError::InvalidDelimiters {
       id: Some("y".to_owned()),
       title: None,
     };
@@ -196,12 +196,12 @@ mod tests {
   #[test]
   fn markdown_error_implements_std_error() {
     fn assert_error<T: std::error::Error>() {}
-    assert_error::<MarkdownError>();
+    assert_error::<MarkdownSkillError>();
   }
 
   #[test]
   fn load_error_implements_std_error() {
     fn assert_error<T: std::error::Error>() {}
-    assert_error::<LoadError>();
+    assert_error::<LoadSkillError>();
   }
 }

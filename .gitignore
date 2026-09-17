@@ -13,7 +13,6 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# Kilocode agent
-.kilo/
-AGENTS.md
-doc/
+# Agents
+agents
+.kilocode

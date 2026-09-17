@@ -4,7 +4,7 @@
 //! core metadata and a body containing the instructions. The parser validates
 //! the required fields and rejects empty instruction bodies.
 
-use crate::skill::error::MarkdownError;
+use crate::skill::error::MarkdownSkillError;
 use crate::skill::types::DomainSkill;
 
 /// Best-effort extraction of a scalar YAML field for error context.
@@ -41,13 +41,15 @@ fn quick_extract_field(yaml: &str, field: &str) -> Option<String> {
 ///
 /// Returns an error if the delimiters are missing or malformed.
 #[expect(clippy::arithmetic_side_effects)]
-fn split_frontmatter(content: &str) -> Result<(&str, &str), MarkdownError> {
+fn split_frontmatter(
+  content: &str,
+) -> Result<(&str, &str), MarkdownSkillError> {
   let rest = if let Some(r) = content.strip_prefix("---\n") {
     r
   } else if let Some(r) = content.strip_prefix("---\r\n") {
     r
   } else {
-    return Err(MarkdownError::InvalidDelimiters {
+    return Err(MarkdownSkillError::InvalidDelimiters {
       id: None,
       title: None,
     });
@@ -71,7 +73,7 @@ fn split_frontmatter(content: &str) -> Result<(&str, &str), MarkdownError> {
     return Ok((frontmatter, ""));
   }
 
-  Err(MarkdownError::InvalidDelimiters {
+  Err(MarkdownSkillError::InvalidDelimiters {
     id: None,
     title: None,
   })
@@ -149,25 +151,25 @@ impl DomainSkill {
   ///
   /// # Errors
   ///
-  /// Returns [`MarkdownError::InvalidDelimiters`] if the opening `---\n`
+  /// Returns [`MarkdownSkillError::InvalidDelimiters`] if the opening `---\n`
   /// or closing `\n---\n` delimiters are missing or malformed.
   ///
-  /// Returns [`MarkdownError::YamlParse`] if the frontmatter is not valid
+  /// Returns [`MarkdownSkillError::YamlParse`] if the frontmatter is not valid
   /// YAML.
   ///
-  /// Returns [`MarkdownError::MissingField`] if `id`, `title`,
+  /// Returns [`MarkdownSkillError::MissingField`] if `id`, `title`,
   /// `description`, or `version` is missing or is not a YAML string.
   ///
-  /// Returns [`MarkdownError::EmptyBody`] if the body is empty or
+  /// Returns [`MarkdownSkillError::EmptyBody`] if the body is empty or
   /// whitespace-only after trimming.
-  pub fn from_markdown(content: &str) -> Result<Self, MarkdownError> {
+  pub fn from_markdown(content: &str) -> Result<Self, MarkdownSkillError> {
     let (frontmatter, body) = split_frontmatter(content)?;
 
     let scanned_id = quick_extract_field(frontmatter, "id");
     let scanned_title = quick_extract_field(frontmatter, "title");
 
     serde_saphyr::from_str::<serde::de::IgnoredAny>(frontmatter).map_err(
-      |e| MarkdownError::YamlParse {
+      |e| MarkdownSkillError::YamlParse {
         id: scanned_id.clone(),
         title: scanned_title.clone(),
         msg: e.to_string(),
@@ -175,7 +177,7 @@ impl DomainSkill {
     )?;
 
     let id = extract_field(frontmatter, "id").ok_or_else(|| {
-      MarkdownError::MissingField {
+      MarkdownSkillError::MissingField {
         id: scanned_id,
         title: scanned_title,
         field: "id".to_owned(),
@@ -183,7 +185,7 @@ impl DomainSkill {
     })?;
 
     let title = extract_field(frontmatter, "title").ok_or_else(|| {
-      MarkdownError::MissingField {
+      MarkdownSkillError::MissingField {
         id: Some(id.clone()),
         title: None,
         field: "title".to_owned(),
@@ -192,7 +194,7 @@ impl DomainSkill {
 
     let description =
       extract_field(frontmatter, "description").ok_or_else(|| {
-        MarkdownError::MissingField {
+        MarkdownSkillError::MissingField {
           id: Some(id.clone()),
           title: Some(title.clone()),
           field: "description".to_owned(),
@@ -200,7 +202,7 @@ impl DomainSkill {
       })?;
 
     let version = extract_field(frontmatter, "version").ok_or_else(|| {
-      MarkdownError::MissingField {
+      MarkdownSkillError::MissingField {
         id: Some(id.clone()),
         title: Some(title.clone()),
         field: "version".to_owned(),
@@ -209,7 +211,7 @@ impl DomainSkill {
 
     let body_trimmed = body.trim();
     if body_trimmed.is_empty() {
-      return Err(MarkdownError::EmptyBody {
+      return Err(MarkdownSkillError::EmptyBody {
         id: Some(id),
         title: Some(title),
       });
@@ -264,7 +266,7 @@ mod tests {
   ) {
     let err = DomainSkill::from_markdown(input).unwrap_err();
     match err {
-      MarkdownError::YamlParse { id, .. } => {
+      MarkdownSkillError::YamlParse { id, .. } => {
         assert_eq!(id.as_deref(), expected_id);
       }
       other => panic!("Expected YamlParse, got: {other:?}"),
@@ -276,7 +278,7 @@ mod tests {
     let input = "---\ntitle: T\ndescription: D\nversion: 1.0.0\n---\nbody";
     let err = DomainSkill::from_markdown(input).unwrap_err();
     match err {
-      MarkdownError::MissingField { field, .. } => {
+      MarkdownSkillError::MissingField { field, .. } => {
         assert_eq!(field, "id");
       }
       other => panic!("Expected MissingField, got: {other:?}"),
@@ -288,7 +290,7 @@ mod tests {
     let input = "---\nid: x\ndescription: D\nversion: 1.0.0\n---\nbody";
     let err = DomainSkill::from_markdown(input).unwrap_err();
     match err {
-      MarkdownError::MissingField { id, ref field, .. } => {
+      MarkdownSkillError::MissingField { id, ref field, .. } => {
         assert_eq!(id.as_deref(), Some("x"));
         assert_eq!(field, "title");
       }
@@ -301,7 +303,7 @@ mod tests {
     let input = "---\nid: x\ntitle: T\nversion: 1.0.0\n---\nbody";
     let err = DomainSkill::from_markdown(input).unwrap_err();
     match err {
-      MarkdownError::MissingField {
+      MarkdownSkillError::MissingField {
         id,
         title,
         ref field,
@@ -330,7 +332,7 @@ mod tests {
   ) {
     let err = DomainSkill::from_markdown(input).unwrap_err();
     match err {
-      MarkdownError::EmptyBody { id, .. } => {
+      MarkdownSkillError::EmptyBody { id, .. } => {
         assert_eq!(id.as_deref(), expected_id);
       }
       other => panic!("Expected EmptyBody, got: {other:?}"),
@@ -346,7 +348,7 @@ mod tests {
   fn invalid_delimiters(#[case] input: &str) {
     let err = DomainSkill::from_markdown(input).unwrap_err();
     assert!(
-      matches!(err, MarkdownError::InvalidDelimiters { .. }),
+      matches!(err, MarkdownSkillError::InvalidDelimiters { .. }),
       "Expected InvalidDelimiters, got: {err:?}"
     );
   }
@@ -385,7 +387,7 @@ mod tests {
   ) {
     let err = DomainSkill::from_markdown(input).unwrap_err();
     match err {
-      MarkdownError::MissingField { ref field, .. } => {
+      MarkdownSkillError::MissingField { ref field, .. } => {
         assert_eq!(field, expected_field);
       }
       other => panic!("Expected MissingField, got: {other:?}"),
@@ -396,7 +398,7 @@ mod tests {
   fn empty_string_input() {
     let err = DomainSkill::from_markdown("").unwrap_err();
     assert!(
-      matches!(err, MarkdownError::InvalidDelimiters { .. }),
+      matches!(err, MarkdownSkillError::InvalidDelimiters { .. }),
       "Expected InvalidDelimiters, got: {err:?}"
     );
   }
