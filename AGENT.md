@@ -191,8 +191,8 @@ This section takes priority over style or code brevity.
 
 ## 7. Documentation (rustdoc)
 
-- Always in English. Document before implementing when possible; in
-  any case, every public item is documented without exception before
+- Always in English. 
+- Every public item is documented without exception before
   closing the task.
 - Private items: document only if the logic isn't obvious.
 - Any code change implies reviewing and updating its doc comment and,
@@ -201,13 +201,16 @@ This section takes priority over style or code brevity.
   need to explain the what, the name is poorly chosen.
 - `// SAFETY:` notes and panic-invariant notes are never removed for
   seeming "redundant."
+- Comments the system in such a way that engineers who may need to add new features in the future, as well as users who will be using it, are able to understand the system without looking at the code.
+- In particular, module files must include very comprehensive documentation, preferably with examples.  
 - The general format would be:
   - First line: concise description of what this crate is for.
   - Subsequent lines, with one blank line in between, a full
     explanation covering functionality, special cases, and examples
-    if needed (especially for public libs). Don't list types unless
-    strictly necessary as an aid to understanding something — types
-    are already shown via `cargo doc`.
+    if needed (especially for public libs). Don't list types in header modules unless strictly necessary as an aid to understanding
+    something. Types are already shown via `cargo doc`.
+    If it is possible and appropriate to include a reference to a type,
+    you can do so anywhere in the comment when needed.
 
 ---
 
@@ -239,6 +242,7 @@ This section takes priority over style or code brevity.
 
 - Run `cargo clippy --all-targets -- -D warnings` to analyze the code.
 - Run `cargo doc --no-deps` to analyze the documentation.
+- Run `cargo check` to analyze the compilation. Decide for yourself if you need a parameter.
 
 ---
 
