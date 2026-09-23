@@ -74,17 +74,18 @@ impl PlatformSkill {
 /// `derive_builder`).
 #[derive(Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[builder(pattern = "owned")]
+#[non_exhaustive]
 pub struct DomainSkill {
   /// Unique identifier for this skill (e.g. `"my-custom-skill"`).
-  pub(crate) id: String,
+  pub id: String,
   /// Human-readable title (e.g. `"My Custom Skill"`).
-  pub(crate) title: String,
+  pub title: String,
   /// Short description shown in the skill catalog.
-  pub(crate) description: String,
+  pub description: String,
   /// Full instructions injected into the agent context when loaded.
-  pub(crate) instructions: String,
+  pub instructions: String,
   /// Version of the skill definition in semantic-version format.
-  pub(crate) version: String,
+  pub version: String,
 }
 
 impl DomainSkill {
