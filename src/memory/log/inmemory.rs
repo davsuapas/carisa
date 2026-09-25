@@ -60,9 +60,10 @@ impl LogStorage for InMemoryLogStorage {
       if is_condensation || partitions.is_empty() {
         partitions.push(Vec::new());
       }
-      let partition = partitions.last_mut().ok_or_else(|| LogError::Internal {
-        message: "active session has no partition".to_owned(),
-      })?;
+      let partition =
+        partitions.last_mut().ok_or_else(|| LogError::Internal {
+          message: "active session has no partition".to_owned(),
+        })?;
       partition.push(message);
     }
 
