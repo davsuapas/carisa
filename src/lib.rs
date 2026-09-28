@@ -7,7 +7,7 @@ pub mod agent;
 pub mod memory;
 pub mod skill;
 
-pub use agent::types::AgentBuilder;
+pub use agent::AgentBuilder;
 pub use memory::log;
 pub use skill::{
   DomainSkill, DomainSkillBuilder, LoadSkillError, MarkdownSkillError,
