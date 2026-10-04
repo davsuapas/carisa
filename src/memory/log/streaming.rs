@@ -47,7 +47,7 @@ use super::{
 /// use futures_util::stream;
 /// use rig_core::streaming::StreamedAssistantContent;
 ///
-/// # async fn example(storage: std::sync::Arc<dyn crate::memory::log::storage::LogStorage>) {
+/// # async fn example(storage: std::sync::Arc<dyn carisa_core::memory::log::storage::LogStorage>) {
 /// let on_user_delta = |delta: &str| println!("text: {delta}");
 /// let on_thinking_delta = |delta: &str| println!("thinking: {delta}");
 ///
@@ -66,7 +66,7 @@ use super::{
 ///   )),
 /// ];
 ///
-/// let _ = crate::memory::log::streaming::process_stream_and_log(
+/// let _ = carisa_core::memory::log::streaming::process_stream_and_log(
 ///   stream::iter(items),
 ///   "agent-1",
 ///   "session-1",

@@ -1,11 +1,5 @@
 # AGENTS.md — Coding Rules (Rust)
 
-> Philosophy: control complexity, not just make it compile.
-> The compiler (borrow checker, type system) is an ally: if it forces
-> a design, listen to it before adding indirection or `.clone()`.
-
----
-
 ## 0. Agent Workflow
 
 Before writing code:
@@ -13,20 +7,13 @@ Before writing code:
 1. If anything in the plan is ambiguous or violates a rule in this
    document, raise it with the user before continuing. Do not resolve
    it on your own.
-2. Refactor **before** adding new functionality, never at the same
-   time. If external behavior changes, it is not refactoring.
-3. Create generic, reusable structures and functions.
-4. Eliminate unnecessary complexity.
-5. Encapsulate complexity.
+2. Create generic, reusable structures and functions.
+3. Eliminate unnecessary complexity and encapsulate complexity.
 
 Before considering the task done:
 
-- [ ] External behavior has not changed (unless that was the goal).
 - [ ] Tests, formatting, lints, and documentation verified.
 - [ ] Comments and docs updated if the code changed.
-- [ ] No new technical debt introduced without justification.
-- [ ] **Structural** refactoring (hierarchies, architectural pattern)
-      → raise it with the user, don't decide alone.
 
 ---
 
@@ -98,7 +85,18 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 2. Conversions
+## 2. Builders (`derive_builder`)
+
+Always use `derive_builder` for structs with optional or validated fields, when possible.
+
+- Optional fields: `#[builder(default, setter(into, strip_option))]` (drop `strip_option` if the field isn't `Option<T>`).
+- Required fields: take them as parameters in `FooBuilder::new(...)`, not in `build()`.
+- Private properties with public getters
+- Validation: `#[builder(build_fn(validate = "Self::validate"))]`.
+
+---
+
+## 3. Conversions
 
 - Before writing any manual conversion logic between types, check
   whether `From`/`TryFrom` already exists (or can be implemented), or
@@ -114,7 +112,7 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 3. Making Invalid States Unrepresentable
+## 4. Making Invalid States Unrepresentable
 
 - If you see `if !self.initialized`, repeated defensive checks before
   using a value, or two `bool`s in a struct that together create
@@ -128,7 +126,7 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 4. Pattern Selection: Quick Reference Table
+## 5. Pattern Selection: Quick Reference Table
 
 | Situation                                                         | Solution                                                          |
 | ----------------------------------------------------------------- | ----------------------------------------------------------------- |
@@ -137,7 +135,6 @@ This section takes priority over style or code brevity.
 | Stateless interchangeable algorithm                               | closure / fn pointer                                              |
 | Stateful interchangeable algorithm                                | generic `impl Trait` or `Box<dyn Trait>`                          |
 | Resource that must always be released                             | `impl Drop` (RAII)                                                |
-| Constructor fields or optional fields with validation             | Builder (`derive_builder`)                                        |
 | Type safety over a primitive                                      | Newtype (tuple struct)                                            |
 | Notification to multiple consumers                                | Channels (`mpsc`, `broadcast`, `crossbeam`)                       |
 | Shared mutable state across tasks, one-way communication          | Channel, not `Arc<Mutex<T>>`                                      |
@@ -148,13 +145,10 @@ This section takes priority over style or code brevity.
   the case adds unnecessary heap allocation.
 - `Deref` is only for smart pointers. Never use it to emulate
   inheritance between unrelated structs; use explicit composition.
-- `#![deny(warnings)]` is forbidden in library code (it breaks with
-  new compiler lints). The CI equivalent is `RUSTFLAGS="-D warnings"`,
-  or selective `#[deny(...)]`.
 
 ---
 
-## 5. Errors as Values
+## 6. Errors as Values
 
 - A function that fails predictably (parsing, I/O, input validation)
   returns `Result<T, E>`, never `panic!`/`unwrap()`/`expect()` on that
@@ -171,7 +165,7 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 6. Formatting and Organization
+## 7. Formatting and Organization
 
 - Maximum 80 characters per line, including docs and comments.
 - 2-space indentation, never tabs.
@@ -179,7 +173,7 @@ This section takes priority over style or code brevity.
   their caller (proximity), helpers at the end.
 - Constants always at the top of the module; never bare magic values
   scattered through the logic.
-- One blank line between logical sections of a function and before a
+- **One blank line between logical sections into a function** and before a
   comment that introduces a new block. Never a blank line right at
   the start of an `if`/`for`/`match`.
 - Declare variables as close as possible to where they're used, unless
@@ -189,7 +183,7 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 7. Documentation (rustdoc)
+## 8. Documentation (rustdoc)
 
 - Always in English. 
 - Every public item is documented without exception before
@@ -199,8 +193,6 @@ This section takes priority over style or code brevity.
   if the module's responsibility changes, its header.
 - Code comments (`//`) explain the **why**, never the what; if you
   need to explain the what, the name is poorly chosen.
-- `// SAFETY:` notes and panic-invariant notes are never removed for
-  seeming "redundant."
 - Comments the system in such a way that engineers who may need to add new features in the future, as well as users who will be using it, are able to understand the system without looking at the code.
 - In particular, module files must include very comprehensive documentation, preferably with examples.  
 - The general format would be:
@@ -209,12 +201,11 @@ This section takes priority over style or code brevity.
     explanation covering functionality, special cases, and examples
     if needed (especially for public libs). Don't list types in header modules unless strictly necessary as an aid to understanding
     something. Types are already shown via `cargo doc`.
-    If it is possible and appropriate to include a reference to a type,
-    you can do so anywhere in the comment when needed.
+    If it is possible and appropriate to include a reference to a type, you can do so anywhere in the comment when needed.
 
 ---
 
-## 8. Testing
+## 9. Testing
 
 - All code requires tests, except pure CI/CD infrastructure (and even
   then, document the reason for the exception in the code).
@@ -238,7 +229,7 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 9. Code Analysis
+## 10. Code Analysis
 
 - Run `cargo clippy --all-targets -- -D warnings` to analyze the code.
 - Run `cargo doc --no-deps` to analyze the documentation.
@@ -246,7 +237,7 @@ This section takes priority over style or code brevity.
 
 ---
 
-## 10. Preferred Crates and Tools
+## 11. Preferred Crates and Tools
 
 - `derive_builder` for the Builder pattern, instead of implementing it
   by hand.

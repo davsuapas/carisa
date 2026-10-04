@@ -77,15 +77,15 @@ impl PlatformSkill {
 #[non_exhaustive]
 pub struct DomainSkill {
   /// Unique identifier for this skill (e.g. `"my-custom-skill"`).
-  pub id: String,
+  id: String,
   /// Human-readable title (e.g. `"My Custom Skill"`).
-  pub title: String,
+  title: String,
   /// Short description shown in the skill catalog.
-  pub description: String,
+  description: String,
   /// Full instructions injected into the agent context when loaded.
-  pub instructions: String,
+  instructions: String,
   /// Version of the skill definition in semantic-version format.
-  pub version: String,
+  version: String,
 }
 
 impl DomainSkill {
@@ -112,62 +112,6 @@ impl DomainSkill {
   /// Returns the skill definition version.
   pub fn version(&self) -> &str {
     &self.version
-  }
-}
-
-/// Homogeneous storage for platform and domain skills.
-///
-/// Wraps both [`PlatformSkill`] and [`DomainSkill`] into a single
-/// type for storage in a single `HashMap`. Avoids dynamic dispatch
-/// (`dyn Trait`) and its associated heap allocation.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum Skill {
-  /// A platform-defined skill (core-only).
-  Platform(PlatformSkill),
-  /// A user-defined or markdown-loaded skill.
-  Domain(DomainSkill),
-}
-
-impl Skill {
-  /// Returns the skill's unique identifier.
-  pub fn id(&self) -> &str {
-    match self {
-      Self::Platform(p) => p.id(),
-      Self::Domain(d) => d.id(),
-    }
-  }
-
-  /// Returns the human-readable title.
-  pub fn title(&self) -> &str {
-    match self {
-      Self::Platform(p) => p.title(),
-      Self::Domain(d) => d.title(),
-    }
-  }
-
-  /// Returns the short description.
-  pub fn description(&self) -> &str {
-    match self {
-      Self::Platform(p) => p.description(),
-      Self::Domain(d) => d.description(),
-    }
-  }
-
-  /// Returns the full instructions string.
-  pub fn instructions(&self) -> &str {
-    match self {
-      Self::Platform(p) => p.instructions(),
-      Self::Domain(d) => d.instructions(),
-    }
-  }
-
-  /// Returns the skill definition version.
-  pub fn version(&self) -> &str {
-    match self {
-      Self::Platform(p) => p.version(),
-      Self::Domain(d) => d.version(),
-    }
   }
 }
 
@@ -247,37 +191,6 @@ mod tests {
     };
     assert_eq!(meta.id, "test-id");
     assert_eq!(meta.description, "test-desc");
-  }
-
-  #[test]
-  fn skill_enum_accepts_both_variants() {
-    let platform = PlatformSkillBuilder::default()
-      .id("p".to_owned())
-      .title("t".to_owned())
-      .description("d".to_owned())
-      .instructions("i".to_owned())
-      .version("1.0.0".to_owned())
-      .always_load(false)
-      .build()
-      .expect("all fields provided");
-    let domain = DomainSkillBuilder::default()
-      .id("d".to_owned())
-      .title("t".to_owned())
-      .description("d".to_owned())
-      .instructions("i".to_owned())
-      .version("2.0.0".to_owned())
-      .build()
-      .expect("all fields provided");
-
-    let p = Skill::Platform(platform);
-    let d = Skill::Domain(domain);
-
-    let desc = |s: &Skill| match s {
-      Skill::Platform(ps) => ps.description().to_owned(),
-      Skill::Domain(ds) => ds.description().to_owned(),
-    };
-    assert_eq!(desc(&p), "d");
-    assert_eq!(desc(&d), "d");
   }
 
   /// T2-CP1: `PlatformSkillBuilder` with all fields produces Ok with

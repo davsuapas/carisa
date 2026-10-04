@@ -1,55 +1,120 @@
-//! Agent runtime and type-state builders.
+//! Agent definitions and builders for runtime use.
 //!
-//! This module exposes the public API used to construct runtime agents while
-//! keeping the state-machine logic.
+//! An [`Agent`] groups required instructions with optional domain skills,
+//! platform skills, and an explicit model selection. Create it with
+//! [`AgentBuilder`], then pass the completed value to
+//! [`crate::AgentPlatformBuilder::agent`] or
+//! [`crate::AgentPlatformBuilder::agents`]. The agent is a configuration
+//! value; this module does not load skills or execute model requests.
 //!
-//! # Building with the builder
+//! # Building an agent
 //!
-//! An agent without additional configuration can be built directly from the
-//! initial state:
+//! Instructions are required. Skills and the model are optional. A domain
+//! skill describes a reusable, domain-specific capability; a platform skill
+//! represents a runtime capability and can be marked to load automatically
+//! for every agent session. Build skills separately and provide them to the
+//! corresponding builder fields.
 //!
-//! ```
-//! use carisa_core::AgentBuilder;
+//! ```rust
+//! use carisa_core::{AgentBuilder, AgentModel, DomainSkillBuilder};
+//!
+//! let research_skill = DomainSkillBuilder::default()
+//!   .id("research".to_owned())
+//!   .title("Research".to_owned())
+//!   .description("Find and compare relevant sources.".to_owned())
+//!   .instructions("Check reliable sources.".to_owned())
+//!   .version("1.0.0".to_owned())
+//!   .build()
+//!   .expect("all required skill fields are set");
 //!
 //! let agent = AgentBuilder::default()
-//!   .instructions("Help the user".to_owned())
+//!   .instructions("Answer clearly and cite relevant evidence.".to_owned())
+//!   .domain_skills(vec![research_skill])
+//!   .model(AgentModel::new("gpt-4o"))
 //!   .build()
-//!   .expect("all fields provided");
+//!   .expect("agent instructions are set");
+//!
+//! assert_eq!(agent.model().map(AgentModel::id), Some("gpt-4o"));
 //! ```
 //!
-//! Domain skills and instructions can also be configured before building it:
+//! [`AgentModel`] selects a model by its platform-configured ID. If omitted,
+//! the runtime can use the platform's default model. It can also carry
+//! per-agent [`Generation`] settings and
+//! additional provider-specific parameters; these are optional overrides,
+//! not a separate model definition. When an agent is attached to a platform,
+//! platform validation rejects an explicit model ID that is not configured.
 //!
-//! ```
-//! use carisa_core::AgentBuilder;
-//!
-//! let agent = AgentBuilder::default()
-//!   .instructions("Help the user".to_owned())
-//!   .domain_skills(Vec::new())
-//!   .build()
-//!   .expect("all fields provided");
-//! ```
-//!
-//! To include platform skills, drops standard platform skills,
-//! start the transition with [`AgentBuilder::platform_skills`]:
-//!
-//! ```
-//! use carisa_core::AgentBuilder;
-//!
-//! let agent = AgentBuilder::default()
-//!   .instructions("Help the user".to_owned())
-//!   .platform_skills(Vec::new())
-//!   .build()
-//!   .expect("all fields provided");
-//! ```
+//! Builder setters for `domain_skills` and `platform_skills` replace the
+//! entire corresponding list when called again; they do not append. Supply
+//! the full list in one call. In contrast, a platform builder's `agent` and
+//! `agents` methods append completed agents.
 
-//! Agent types and builders.
+use std::collections::HashMap;
 
 use derive_builder::Builder;
+use serde::{Deserialize, Serialize};
 
-use crate::{DomainSkill, PlatformSkill};
+use crate::{DomainSkill, PlatformSkill, runtime::config::Generation};
+
+/// Model configuration selected for an agent.
+#[derive(Builder, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[builder(pattern = "owned")]
+#[non_exhaustive]
+pub struct AgentModel {
+  /// Model identifier.
+  id: String,
+  /// Generation options specific to this model selection.
+  #[serde(default)]
+  #[builder(default, setter(into, strip_option))]
+  generation: Option<Generation>,
+  /// Additional parameters specific to this model selection.
+  #[serde(default)]
+  #[builder(default, setter(into, strip_option))]
+  additional_params: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl AgentModel {
+  /// Creates a model configuration with no overrides.
+  pub fn new(id: impl Into<String>) -> Self {
+    Self {
+      id: id.into(),
+      generation: None,
+      additional_params: None,
+    }
+  }
+
+  /// Returns the model identifier.
+  pub fn id(&self) -> &str {
+    &self.id
+  }
+
+  /// Returns the optional generation configuration.
+  pub const fn generation(&self) -> Option<&Generation> {
+    self.generation.as_ref()
+  }
+
+  /// Returns the additional parameters.
+  pub const fn additional_params(
+    &self,
+  ) -> Option<&HashMap<String, serde_json::Value>> {
+    self.additional_params.as_ref()
+  }
+}
+
+impl From<String> for AgentModel {
+  fn from(id: String) -> Self {
+    Self::new(id)
+  }
+}
+
+impl From<&str> for AgentModel {
+  fn from(id: &str) -> Self {
+    Self::new(id)
+  }
+}
 
 /// Initial builder state.
-#[derive(Builder, Debug, Clone, Default)]
+#[derive(Builder, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Agent {
   /// Instructions for the agent.
   instructions: String,
@@ -59,6 +124,9 @@ pub struct Agent {
   /// Platform skills for the agent.
   #[builder(default)]
   platform_skills: Vec<PlatformSkill>,
+  /// Optional explicit model binding for this agent.
+  #[builder(default, setter(into, strip_option))]
+  model: Option<AgentModel>,
 }
 
 impl Agent {
@@ -73,10 +141,13 @@ impl Agent {
   }
 
   /// Returns the platform skills for the agent.
-  ///
-  /// Drops any standard platform skills  
   pub fn platform_skills(&self) -> &[PlatformSkill] {
     &self.platform_skills
+  }
+
+  /// Returns the optional model configuration for the agent.
+  pub const fn model(&self) -> Option<&AgentModel> {
+    self.model.as_ref()
   }
 }
 
@@ -164,5 +235,48 @@ mod tests {
       .expect("all fields provided");
 
     assert_eq!(agent.platform_skills, vec![second]);
+  }
+
+  #[test]
+  fn model_accepts_identifier_and_optional_overrides() {
+    let mut additional_params = HashMap::new();
+    additional_params.insert("reasoning_effort".to_owned(), "high".into());
+    let model = AgentModelBuilder::default()
+      .id("model-id".to_owned())
+      .generation(Generation::default())
+      .additional_params(additional_params.clone())
+      .build()
+      .expect("model identifier provided");
+    let agent = AgentBuilder::default()
+      .instructions("Instructions".to_owned())
+      .model(model)
+      .build()
+      .expect("instructions provided");
+
+    assert_eq!(agent.model.as_ref().unwrap().id, "model-id");
+    assert_eq!(
+      agent.model.unwrap().additional_params,
+      Some(additional_params)
+    );
+  }
+
+  #[test]
+  fn model_overrides_are_optional_when_building_and_deserializing() {
+    let built_model = AgentModelBuilder::default()
+      .id("model-id".to_owned())
+      .build()
+      .expect("model identifier is sufficient");
+
+    assert!(built_model.generation.is_none());
+    assert!(built_model.additional_params.is_none());
+
+    let model: AgentModel = serde_json::from_value(serde_json::json!({
+      "id": "model-id"
+    }))
+    .expect("model identifier is sufficient");
+
+    assert_eq!(model.id, "model-id");
+    assert!(model.generation.is_none());
+    assert!(model.additional_params.is_none());
   }
 }

@@ -49,6 +49,6 @@ pub mod types;
 
 pub use error::{LoadSkillError, MarkdownSkillError};
 pub use types::{
-  DomainSkill, DomainSkillBuilder, PlatformSkill, PlatformSkillBuilder, Skill,
+  DomainSkill, DomainSkillBuilder, PlatformSkill, PlatformSkillBuilder,
   SkillMetadata,
 };

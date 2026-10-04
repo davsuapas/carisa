@@ -5,11 +5,15 @@
 
 pub mod agent;
 pub mod memory;
+pub mod runtime;
 pub mod skill;
 
-pub use agent::AgentBuilder;
+pub use agent::{Agent, AgentBuilder, AgentModel};
 pub use memory::log;
+pub use runtime::{
+  AgentPlatform, AgentPlatformBuilder, PlatformError, ProviderKind, Secret,
+};
 pub use skill::{
   DomainSkill, DomainSkillBuilder, LoadSkillError, MarkdownSkillError,
-  PlatformSkill, PlatformSkillBuilder, Skill, SkillMetadata,
+  PlatformSkill, PlatformSkillBuilder, SkillMetadata,
 };

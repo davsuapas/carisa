@@ -193,6 +193,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "ulid",
+ "url",
  "zstd",
 ]
 

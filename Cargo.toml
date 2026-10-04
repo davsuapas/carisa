@@ -19,6 +19,7 @@ serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 ulid = "3.0.0"
+url = "2"
 zstd = "0.14"
 
 [dev-dependencies]

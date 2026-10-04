@@ -46,6 +46,15 @@ pub enum MarkdownSkillError {
     /// Skill title, if parsed.
     title: Option<String>,
   },
+  /// The YAML frontmatter contains invalid syntax.
+  DomainSkillBuilder {
+    /// Skill id, if parsed before the error occurred.
+    id: String,
+    /// Skill title, if parsed before the error occurred.
+    title: String,
+    /// Human-readable error.
+    msg: String,
+  },
 }
 
 impl std::fmt::Display for MarkdownSkillError {
@@ -86,6 +95,9 @@ impl std::fmt::Display for MarkdownSkillError {
         } else {
           write!(f, "Invalid markdown delimiters")
         }
+      }
+      Self::DomainSkillBuilder { id, title: _, msg } => {
+        write!(f, "Failed to build DomainSkill for skill '{id}': {msg}")
       }
     }
   }
