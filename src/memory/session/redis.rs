@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use redis::{AsyncCommands, Client, aio::ConnectionManager};
 
-use crate::log::{
+use crate::session::{
   LogError, LogMessage, LogMessageKind, MessageId, SessionMeta,
   StoredLogMessage,
   storage::{LogStorage, SessionMetaStore},

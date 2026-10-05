@@ -235,7 +235,7 @@ mod tests {
   };
 
   use super::process_stream_and_log;
-  use crate::memory::log::{
+  use crate::memory::session::{
     inmemory::InMemoryLogStorage, storage::LogStorage, types::LogMessageKind,
   };
 

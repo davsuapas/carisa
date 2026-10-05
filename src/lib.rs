@@ -9,7 +9,7 @@ pub mod runtime;
 pub mod skill;
 
 pub use agent::{Agent, AgentBuilder, AgentModel};
-pub use memory::log;
+pub use memory::session;
 pub use runtime::{
   AgentPlatform, AgentPlatformBuilder, PlatformError, ProviderKind, Secret,
 };

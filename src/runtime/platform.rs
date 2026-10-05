@@ -10,7 +10,7 @@ use std::{fs, path::Path, sync::Arc};
 
 use derive_builder::Builder;
 
-use crate::memory::log::LogStorage;
+use crate::memory::session::LogStorage;
 
 use super::{
   config::{Defaults, Http, Model, Provider},
@@ -461,7 +461,7 @@ fn parse_env_value(value: String) -> serde_json::Value {
 mod tests {
   use super::*;
   use crate::{
-    memory::log::inmemory::InMemoryLogStorage,
+    memory::session::inmemory::InMemoryLogStorage,
     runtime::config::{
       Generation, ModelBuilder, ProviderBuilder, Retries, TlsBuilder,
     },

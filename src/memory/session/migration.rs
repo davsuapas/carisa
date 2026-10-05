@@ -53,7 +53,7 @@ mod tests {
   use async_trait::async_trait;
 
   use super::{LogError, migrate_session_to_cold};
-  use crate::memory::log::{
+  use crate::memory::session::{
     inmemory::{
       InMemoryColdStorage, InMemoryLogStorage, InMemorySessionMetaStore,
     },

@@ -325,7 +325,7 @@ fn to_rig_reasoning_content(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::memory::log::types::{AgentId, SessionId, now_millis};
+  use crate::memory::session::types::{AgentId, SessionId, now_millis};
 
   fn assistant(id: &str, provider: Option<&str>) -> LogMessage {
     message(
