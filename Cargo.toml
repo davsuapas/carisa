@@ -11,16 +11,16 @@ repository = "https://github.com/davsuapas/carisa"
 async-trait = "0.1.92"
 derive_builder = "0.20.2"
 futures-util = "0.3.34"
-redis = { version = "1.7.0", features = ["tokio-comp", "connection-manager"] }
-rig-core = "0.42.0"
+redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager"] }
+rig-core = "0.43.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde-saphyr = "1.2.0"
+serde-saphyr = "1.3.0"
 serde_json = "1.0.151"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
 ulid = "3.0.0"
-url = "2"
-zstd = "0.14"
+url = "2.5.8"
+zstd = "0.14.0"
 
 [dev-dependencies]
 redis-test = { version = "1.0.4", features = ["aio"] }

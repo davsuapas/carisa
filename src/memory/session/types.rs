@@ -125,6 +125,8 @@ pub enum LogMessageKind {
     tool_name: String,
     /// Tool arguments as JSON.
     arguments: serde_json::Value,
+    /// Rig call identifier used to associate its result, when available.
+    call_id: Option<String>,
     /// Mensaje asistente al que pertenece.
     parent_assistant_id: Option<MessageId>,
     /// Associated execution step.
@@ -266,6 +268,24 @@ mod tests {
     let restored: LogMessageKind = serde_json::from_str(&serialized).unwrap();
 
     assert!(matches!(restored, LogMessageKind::ToolResult { .. }));
+  }
+
+  #[test]
+  fn reads_tool_calls_without_rig_call_id() {
+    let serialized = serde_json::json!({
+      "type": "tool_call",
+      "tool_name": "lookup",
+      "arguments": {},
+      "parent_assistant_id": "assistant",
+      "step_id": null
+    });
+
+    let restored: LogMessageKind = serde_json::from_value(serialized).unwrap();
+
+    assert!(matches!(
+      restored,
+      LogMessageKind::ToolCall { call_id: None, .. }
+    ));
   }
 
   #[test]

@@ -1,14 +1,15 @@
 //! Projection of persisted logs into provider-agnostic messages.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use rig_core::completion::{
   Message,
   message::{
-    AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolCallId,
+    AssistantContent, Reasoning, ReasoningContent, Text, ToolCall,
     ToolFunction, ToolResult, ToolResultContent, UserContent,
   },
 };
+use rig_core::message::{CallId, Issuer, ToolName};
 
 use super::types::{
   LogMessage, LogMessageKind, StoredReasoning, StoredReasoningContent,
@@ -103,6 +104,7 @@ impl PendingAssistant {
 
 impl From<PendingAssistant> for Message {
   fn from(pending: PendingAssistant) -> Self {
+    let issuer = Issuer::new(pending.provider.unwrap_or_default());
     let mut content = vec![AssistantContent::Text(Text::new(pending.content))];
     content.extend(
       pending
@@ -111,7 +113,9 @@ impl From<PendingAssistant> for Message {
         .map(AssistantContent::ToolCall),
     );
     content.extend(pending.reasoning.into_iter().map(|reasoning| {
-      AssistantContent::Reasoning(to_rig_reasoning(reasoning))
+      AssistantContent::Reasoning(
+        to_rig_reasoning(reasoning).sealed(issuer.clone()),
+      )
     }));
 
     Self::Assistant {
@@ -182,6 +186,7 @@ pub fn project_to_rig_messages(
 ) -> Vec<Message> {
   let mut projected = Vec::new();
   let mut pending = None;
+  let mut tool_names = HashMap::new();
 
   for log in logs {
     let LogMessage { id, kind, .. } = log;
@@ -209,6 +214,7 @@ pub fn project_to_rig_messages(
       LogMessageKind::ToolCall {
         tool_name,
         arguments,
+        call_id,
         parent_assistant_id,
         ..
       } => {
@@ -218,8 +224,11 @@ pub fn project_to_rig_messages(
         if parent_assistant_id.as_deref() != Some(current.id.as_str()) {
           continue;
         }
+        let tool_name = to_rig_tool_name(tool_name);
+        let call_id = CallId::from_wire(call_id.unwrap_or(id));
+        tool_names.insert(call_id.to_string(), tool_name.clone());
         current.tool_calls.push(ToolCall::new(
-          ToolCallId::new_or_mint(id),
+          call_id,
           ToolFunction::new(tool_name, arguments),
         ));
       }
@@ -252,11 +261,14 @@ pub fn project_to_rig_messages(
         } else {
           result.to_string()
         };
+        let name = tool_names
+          .get(&tool_call_id)
+          .cloned()
+          .unwrap_or_else(default_tool_name);
         projected.push(Message::User {
           content: vec![UserContent::ToolResult(ToolResult {
-            call: ToolCallId::new_or_mint(tool_call_id),
-            provider: None,
-            name: String::new(),
+            call: CallId::from_wire(tool_call_id),
+            name,
             content: vec![ToolResultContent::Text(Text::new(text))],
           })],
         });
@@ -269,6 +281,19 @@ pub fn project_to_rig_messages(
 
   flush_pending(&mut projected, &mut pending);
   projected
+}
+
+fn to_rig_tool_name(name: String) -> ToolName {
+  ToolName::new(name).unwrap_or_else(|_| default_tool_name())
+}
+
+#[expect(
+  clippy::expect_used,
+  reason = "the fallback name is a non-empty literal"
+)]
+fn default_tool_name() -> ToolName {
+  ToolName::new("unknown")
+    .expect("the fallback tool name is guaranteed to be non-empty")
 }
 
 fn include_thinking(
@@ -359,6 +384,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({"key": "value"}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -404,6 +430,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("missing".to_owned()),
           step_id: None,
         },
@@ -443,6 +470,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -485,6 +513,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("other-assistant".to_owned()),
           step_id: None,
         },
@@ -543,6 +572,51 @@ mod tests {
   }
 
   #[test]
+  fn preserves_tool_identity_and_name_for_its_result() {
+    let logs = vec![
+      assistant("assistant", Some("provider")),
+      message(
+        "tool-message",
+        LogMessageKind::ToolCall {
+          tool_name: "lookup".to_owned(),
+          arguments: serde_json::json!({"key": "value"}),
+          call_id: Some("rig-call".to_owned()),
+          parent_assistant_id: Some("assistant".to_owned()),
+          step_id: None,
+        },
+      ),
+      message(
+        "result",
+        LogMessageKind::ToolResult {
+          tool_call_id: "rig-call".to_owned(),
+          result: serde_json::json!({"found": true}),
+          is_error: false,
+          error_message: None,
+        },
+      ),
+    ];
+
+    let projected =
+      project_to_rig_messages(logs, &ProjectionOptions::default());
+
+    let Some(Message::Assistant { content, .. }) = projected.first() else {
+      panic!("expected an assistant message");
+    };
+    let Some(AssistantContent::ToolCall(call)) = content.get(1) else {
+      panic!("expected the assistant tool call");
+    };
+    assert_eq!(call.id.to_string(), "rig-call");
+    let Some(Message::User { content }) = projected.get(1) else {
+      panic!("expected a tool result message");
+    };
+    let Some(UserContent::ToolResult(result)) = content.first() else {
+      panic!("expected a projected tool result");
+    };
+    assert_eq!(result.call.to_string(), "rig-call");
+    assert_eq!(result.name.as_str(), "lookup");
+  }
+
+  #[test]
   fn preserves_input_order_for_tool_result_before_assistant() {
     let logs = vec![
       message(
@@ -580,6 +654,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -615,6 +690,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },

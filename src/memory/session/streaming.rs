@@ -4,7 +4,13 @@ use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use rig_core::{
-  completion::message::ReasoningContent, streaming::StreamedAssistantContent,
+  completion::{
+    CompletionResponse,
+    message::{AssistantContent, Reasoning, ReasoningContent, ToolCall},
+  },
+  error::ProviderError,
+  message::Issuer,
+  streaming::{CompletionStream, Item, StreamEvent},
 };
 
 use super::{
@@ -44,30 +50,17 @@ use super::{
 /// With callbacks for live streaming:
 ///
 /// ```rust
-/// use futures_util::stream;
-/// use rig_core::streaming::StreamedAssistantContent;
+/// use rig_core::streaming::CompletionStream;
 ///
-/// # async fn example(storage: std::sync::Arc<dyn carisa_core::memory::log::storage::LogStorage>) {
+/// # async fn example(
+/// #   completion: CompletionStream,
+/// #   storage: std::sync::Arc<dyn carisa_core::memory::session::storage::LogStorage>,
+/// # ) {
 /// let on_user_delta = |delta: &str| println!("text: {delta}");
 /// let on_thinking_delta = |delta: &str| println!("thinking: {delta}");
 ///
-/// let items = vec![
-///   Ok(StreamedAssistantContent::text("hello")),
-///   Ok(StreamedAssistantContent::ReasoningDelta {
-///     id: "r1".to_owned(),
-///     provider_id: None,
-///     reasoning: "thinking".to_owned(),
-///   }),
-///   Ok(StreamedAssistantContent::Final(
-///     rig_core::streaming::StreamFinal::new(
-///       "provider",
-///       rig_core::completion::Usage::default(),
-///     ),
-///   )),
-/// ];
-///
-/// let _ = carisa_core::memory::log::streaming::process_stream_and_log(
-///   stream::iter(items),
+/// let _ = carisa_core::memory::session::streaming::process_stream_and_log(
+///   completion,
 ///   "agent-1",
 ///   "session-1",
 ///   storage,
@@ -85,8 +78,8 @@ use super::{
 ///
 /// Returns an error if the underlying stream yields a completion failure, or if
 /// the storage backend cannot persist one of the generated log entries.
-pub async fn process_stream_and_log<S, UserCallback, ThinkingCallback>(
-  mut stream: S,
+pub async fn process_stream_and_log<UserCallback, ThinkingCallback>(
+  mut stream: CompletionStream,
   agent_id: &str,
   session_id: &str,
   storage: Arc<dyn LogStorage>,
@@ -94,80 +87,149 @@ pub async fn process_stream_and_log<S, UserCallback, ThinkingCallback>(
   on_thinking_delta: Option<ThinkingCallback>,
 ) -> Result<Vec<String>, LogError>
 where
-  S: Stream<
-      Item = Result<
-        StreamedAssistantContent,
-        rig_core::completion::CompletionError,
-      >,
-    > + Unpin,
-  UserCallback: Fn(&str),
-  ThinkingCallback: Fn(&str),
+  UserCallback: Fn(&str) + Send + Sync,
+  ThinkingCallback: Fn(&str) + Send + Sync,
 {
   let assistant_id = generate_message_id();
-  let mut saved_ids = Vec::new();
-  let mut assistant_events = Vec::new();
-  let mut text = String::new();
+  let issuer = stream.reasoning_issuer();
+  let collected = collect_stream_events(
+    &mut stream,
+    &assistant_id,
+    &issuer,
+    on_user_delta.as_ref(),
+    on_thinking_delta.as_ref(),
+  )
+  .await?;
+  let response = stream.partial();
+
+  persist_stream_response(
+    agent_id,
+    session_id,
+    storage,
+    assistant_id,
+    collected,
+    CompletionMetadata::from(response),
+  )
+  .await
+}
+
+struct CollectedStream {
+  text: String,
+  events: Vec<LogMessageKind>,
+}
+
+struct CompletionMetadata {
+  provider: String,
+  model: Option<String>,
+  provider_response_id: Option<String>,
+}
+
+impl From<CompletionResponse> for CompletionMetadata {
+  fn from(response: CompletionResponse) -> Self {
+    Self {
+      provider: response.provider,
+      model: response.model,
+      provider_response_id: response.message_id.or(response.response_id),
+    }
+  }
+}
+
+async fn collect_stream_events<S, UserCallback, ThinkingCallback>(
+  stream: &mut S,
+  assistant_id: &str,
+  issuer: &Issuer,
+  on_user_delta: Option<&UserCallback>,
+  on_thinking_delta: Option<&ThinkingCallback>,
+) -> Result<CollectedStream, LogError>
+where
+  S: Stream<Item = Result<Item<StreamEvent>, ProviderError>> + Send + Unpin,
+  UserCallback: Fn(&str) + Send + Sync,
+  ThinkingCallback: Fn(&str) + Send + Sync,
+{
+  let mut collected = CollectedStream {
+    text: String::new(),
+    events: Vec::new(),
+  };
 
   while let Some(item) = stream.next().await {
-    let item = item.map_err(LogError::Completion)?;
-    match item {
-      StreamedAssistantContent::Text(delta) => {
-        text.push_str(&delta.text);
-        if let Some(callback) = &on_user_delta {
-          callback(&delta.text);
+    match item.map_err(LogError::from)? {
+      Item::Unknown(_) => {}
+      Item::Event(event) => match event {
+        StreamEvent::Text { text, .. } => {
+          collected.text.push_str(&text);
+          if let Some(callback) = on_user_delta {
+            callback(&text);
+          }
         }
-      }
-      StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-        if let Some(callback) = &on_thinking_delta {
-          callback(&reasoning);
+        StreamEvent::Reasoning { text, .. } => {
+          if let Some(callback) = on_thinking_delta {
+            callback(&text);
+          }
         }
-      }
-      StreamedAssistantContent::Reasoning { reasoning, .. } => {
-        assistant_events.push(new_message(
-          agent_id,
-          session_id,
-          LogMessageKind::Thinking {
-            reasoning: to_stored_reasoning(reasoning),
-            parent_assistant_id: Some(assistant_id.clone()),
-          },
-        ));
-      }
-      StreamedAssistantContent::ToolCall { tool_call, .. } => {
-        assistant_events.push(new_message(
-          agent_id,
-          session_id,
-          LogMessageKind::ToolCall {
-            tool_name: tool_call.function.name,
-            arguments: tool_call.function.arguments,
-            parent_assistant_id: Some(assistant_id.clone()),
-            step_id: None,
-          },
-        ));
-      }
-      StreamedAssistantContent::ToolCallDelta { .. }
-      | StreamedAssistantContent::Unknown(_) => {}
-      StreamedAssistantContent::Final(final_response) => {
-        let assistant = new_message_with_id(
-          assistant_id.clone(),
-          agent_id,
-          session_id,
-          LogMessageKind::Assistant {
-            content: std::mem::take(&mut text),
-            provider: Some(final_response.provider),
-            model: final_response.model,
-            provider_response_id: final_response
-              .message_id
-              .or(final_response.response_id),
-          },
-        );
-        let mut messages = vec![assistant];
-        messages.append(&mut assistant_events);
-        saved_ids.extend(storage.append(agent_id, session_id, messages).await?);
-      }
+        StreamEvent::End { content, .. } => match content {
+          AssistantContent::Reasoning(reasoning) => {
+            if let Some(reasoning) = reasoning.open(issuer) {
+              collected.events.push(LogMessageKind::Thinking {
+                reasoning: to_stored_reasoning(reasoning),
+                parent_assistant_id: Some(assistant_id.to_owned()),
+              });
+            }
+          }
+          AssistantContent::ToolCall(tool_call) => {
+            collected
+              .events
+              .push(tool_call_log_event(tool_call, assistant_id));
+          }
+          AssistantContent::Text(_) | AssistantContent::Image(_) => {}
+        },
+        StreamEvent::Start { .. } | StreamEvent::Arguments { .. } => {}
+      },
     }
   }
 
-  Ok(saved_ids)
+  Ok(collected)
+}
+
+fn tool_call_log_event(
+  tool_call: ToolCall,
+  assistant_id: &str,
+) -> LogMessageKind {
+  LogMessageKind::ToolCall {
+    tool_name: tool_call.function.name.to_string(),
+    arguments: tool_call.function.arguments,
+    call_id: Some(tool_call.id.to_string()),
+    parent_assistant_id: Some(assistant_id.to_owned()),
+    step_id: None,
+  }
+}
+
+async fn persist_stream_response(
+  agent_id: &str,
+  session_id: &str,
+  storage: Arc<dyn LogStorage>,
+  assistant_id: String,
+  collected: CollectedStream,
+  metadata: CompletionMetadata,
+) -> Result<Vec<String>, LogError> {
+  let assistant = new_message_with_id(
+    assistant_id,
+    agent_id,
+    session_id,
+    LogMessageKind::Assistant {
+      content: collected.text,
+      provider: Some(metadata.provider),
+      model: metadata.model,
+      provider_response_id: metadata.provider_response_id,
+    },
+  );
+  let mut messages = vec![assistant];
+  messages.extend(
+    collected
+      .events
+      .into_iter()
+      .map(|kind| new_message(agent_id, session_id, kind)),
+  );
+  storage.append(agent_id, session_id, messages).await
 }
 
 fn new_message(
@@ -194,14 +256,13 @@ fn new_message_with_id(
   }
 }
 
-fn to_stored_reasoning(
-  reasoning: rig_core::completion::message::Reasoning,
-) -> StoredReasoning {
+fn to_stored_reasoning(reasoning: &Reasoning) -> StoredReasoning {
   StoredReasoning {
-    id: reasoning.id,
+    id: reasoning.id.clone(),
     content: reasoning
       .content
-      .into_iter()
+      .iter()
+      .cloned()
       .map(to_stored_reasoning_content)
       .collect(),
   }
@@ -230,11 +291,14 @@ mod tests {
 
   use futures_util::stream;
   use rig_core::{
-    completion::message::{ToolCall, ToolCallId, ToolFunction},
-    streaming::{StreamFinal, StreamedAssistantContent},
+    completion::message::{AssistantContent, ToolCall, ToolFunction},
+    message::{CallId, Issuer, ToolName},
+    streaming::{Item, StreamEvent, Transcript},
   };
 
-  use super::process_stream_and_log;
+  use super::{
+    CompletionMetadata, collect_stream_events, persist_stream_response,
+  };
   use crate::memory::session::{
     inmemory::InMemoryLogStorage, storage::LogStorage, types::LogMessageKind,
   };
@@ -262,45 +326,32 @@ mod tests {
           .push(delta.to_owned());
       }
     };
-    let tool_call = ToolCall::new(
-      ToolCallId::new_or_mint("call"),
-      ToolFunction::new(
-        "lookup".to_owned(),
-        serde_json::json!({"key": "value"}),
-      ),
-    );
-    let items = vec![
-      Ok(StreamedAssistantContent::text("hello")),
-      Ok(StreamedAssistantContent::ReasoningDelta {
-        id: "reasoning".to_owned(),
-        provider_id: None,
-        reasoning: "thinking".to_owned(),
-      }),
-      Ok(StreamedAssistantContent::Reasoning {
-        id: "reasoning".to_owned(),
-        reasoning: rig_core::completion::message::Reasoning::new("analysis"),
-      }),
-      Ok(StreamedAssistantContent::ToolCall {
-        tool_call,
-        internal_call_id: "internal".to_owned(),
-      }),
-      Ok(StreamedAssistantContent::Final(StreamFinal::new(
-        "provider",
-        rig_core::completion::Usage::default(),
-      ))),
-    ];
-
-    let storage_for_process = storage_trait(Arc::clone(&storage));
-    let ids = process_stream_and_log(
-      stream::iter(items),
-      "agent",
-      "session",
-      storage_for_process,
-      Some(text_callback),
-      Some(thinking_callback),
+    let items = stream_items();
+    let issuer = Issuer::new("provider");
+    let mut stream = stream::iter(items.into_iter().map(Ok));
+    let collected = collect_stream_events(
+      &mut stream,
+      "assistant",
+      &issuer,
+      Some(&text_callback),
+      Some(&thinking_callback),
     )
     .await
-    .expect("stream should be processed");
+    .expect("stream should be collected");
+    let ids = persist_stream_response(
+      "agent",
+      "session",
+      storage_trait(Arc::clone(&storage)),
+      "assistant".to_owned(),
+      collected,
+      CompletionMetadata {
+        provider: "provider".to_owned(),
+        model: Some("model".to_owned()),
+        provider_response_id: Some("response".to_owned()),
+      },
+    )
+    .await
+    .expect("stream response should be persisted");
     let messages = storage
       .history("agent", "session")
       .await
@@ -327,9 +378,10 @@ mod tests {
     assert!(matches!(
       messages.get(2).map(|message| &message.kind),
       Some(LogMessageKind::ToolCall {
+        call_id: Some(call_id),
         parent_assistant_id: Some(parent_id),
         ..
-      }) if parent_id == assistant_id
+      }) if parent_id == assistant_id && call_id == "call"
     ));
     assert_eq!(
       *text_deltas.lock().expect("text lock should work"),
@@ -339,6 +391,46 @@ mod tests {
       *thinking_deltas.lock().expect("thinking lock should work"),
       ["thinking"]
     );
+    assert!(matches!(
+      messages.first().map(|message| &message.kind),
+      Some(LogMessageKind::Assistant {
+        provider: Some(provider),
+        model: Some(model),
+        provider_response_id: Some(response_id),
+        ..
+      }) if provider == "provider" && model == "model" && response_id == "response"
+    ));
+  }
+
+  fn stream_items() -> Vec<Item<StreamEvent>> {
+    let reasoning = AssistantContent::Reasoning(
+      rig_core::completion::message::Reasoning::new("analysis")
+        .sealed(Issuer::new("provider")),
+    );
+    let tool_call = AssistantContent::ToolCall(ToolCall::new(
+      CallId::from_wire("call"),
+      ToolFunction::new(
+        ToolName::new("lookup").expect("tool name should be valid"),
+        serde_json::json!({"key": "value"}),
+      ),
+    ));
+    let reasoning =
+      serde_json::to_value(reasoning).expect("reasoning should serialize");
+    let tool_call =
+      serde_json::to_value(tool_call).expect("tool call should serialize");
+    let transcript = Transcript::parse(serde_json::json!([
+      {"item": "event", "value": {"event": "start", "part": 0, "kind": "text"}},
+      {"item": "event", "value": {"event": "text", "part": 0, "text": "hello"}},
+      {"item": "event", "value": {"event": "end", "part": 0, "content": {"type": "text", "text": "hello"}}},
+      {"item": "event", "value": {"event": "start", "part": 1, "kind": "reasoning"}},
+      {"item": "event", "value": {"event": "reasoning", "part": 1, "text": "thinking"}},
+      {"item": "event", "value": {"event": "end", "part": 1, "content": reasoning}},
+      {"item": "event", "value": {"event": "start", "part": 2, "kind": "tool_call"}},
+      {"item": "event", "value": {"event": "end", "part": 2, "content": tool_call}}
+    ]))
+    .expect("transcript should be valid");
+
+    transcript.into_items()
   }
 
   fn storage_trait(storage: Arc<InMemoryLogStorage>) -> Arc<dyn LogStorage> {
