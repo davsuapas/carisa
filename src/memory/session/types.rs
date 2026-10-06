@@ -4,12 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::identity::{AgentId, SessionId};
+
 /// Unique identifier of a persisted message.
 pub type MessageId = String;
-/// Identifier of the agent that owns a session.
-pub type AgentId = String;
-/// Identifier of an agent session.
-pub type SessionId = String;
 /// Timestamp expressed as milliseconds since the Unix epoch.
 pub type TimestampMillis = i64;
 

@@ -17,6 +17,11 @@ Before considering the task done:
 
 ---
 
+# 0. Code Navigation
+
+Always read the header comment of root modules first to rule out irrelevant sub-modules, and keep drilling into sub-module headers only when unsure or when one is what you're looking for, before analyzing a full file.
+When you detect a type or symbol and language-server tools are available (usages, go to definition, document symbols), use them to navigate instead of text search.
+
 ## 1. Performance and Memory — apply always, no exceptions
 
 This section takes priority over style or code brevity.
