@@ -189,7 +189,7 @@ mod tests {
       .expect("all fields provided");
 
     assert_eq!(agent.domain_skills(), vec![domain]);
-    assert!(agent.platform_skills().is_empty());
+    assert_eq!(agent.platform_skills().len(), 0);
     assert_eq!(agent.instructions, "Instrucciones");
   }
 

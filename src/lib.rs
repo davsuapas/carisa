@@ -8,6 +8,7 @@ pub mod identity;
 pub mod memory;
 pub mod runtime;
 pub mod skill;
+pub mod telemetry;
 
 pub use agent::{Agent, AgentBuilder, AgentModel};
 pub use identity::{AgentId, SessionId};
@@ -18,4 +19,8 @@ pub use runtime::{
 pub use skill::{
   DomainSkill, DomainSkillBuilder, LoadSkillError, MarkdownSkillError,
   PlatformSkill, PlatformSkillBuilder, SkillMetadata,
+};
+pub use telemetry::{
+  FieldValue, MemorySink, RetryPolicy, SinkError, Telemetry, TelemetryBuilder,
+  TelemetryError, TraceLevel, TraceRecord, TraceSink,
 };

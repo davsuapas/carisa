@@ -6,10 +6,9 @@ use futures_util::{Stream, StreamExt};
 use rig_core::{
   completion::{
     CompletionResponse,
-    message::{AssistantContent, Reasoning, ReasoningContent, ToolCall},
+    message::{AssistantContent, Reasoning, ToolCall},
   },
   error::ProviderError,
-  message::Issuer,
   streaming::{CompletionStream, Item, StreamEvent},
 };
 
@@ -40,8 +39,9 @@ use super::{
 ///
 /// Once the stream reaches `Final`, the function creates the assistant log entry
 /// with the accumulated content and provider metadata, appends all associated
-/// reasoning/tool events, and stores the full batch in the configured log
-/// storage.
+/// reasoning/tool events in the order their complete stream events arrived, and
+/// stores the full batch in the configured log storage. The assistant record is
+/// first, followed by those child events.
 ///
 /// Returns the IDs of the persisted log records.
 ///
@@ -91,11 +91,9 @@ where
   ThinkingCallback: Fn(&str) + Send + Sync,
 {
   let assistant_id = generate_message_id();
-  let issuer = stream.reasoning_issuer();
   let collected = collect_stream_events(
     &mut stream,
     &assistant_id,
-    &issuer,
     on_user_delta.as_ref(),
     on_thinking_delta.as_ref(),
   )
@@ -127,9 +125,9 @@ struct CompletionMetadata {
 impl From<CompletionResponse> for CompletionMetadata {
   fn from(response: CompletionResponse) -> Self {
     Self {
-      provider: response.provider,
-      model: response.model,
-      provider_response_id: response.message_id.or(response.response_id),
+      provider: response.provider().to_owned(),
+      model: response.model().map(str::to_owned),
+      provider_response_id: response.response_id().map(str::to_owned),
     }
   }
 }
@@ -137,7 +135,6 @@ impl From<CompletionResponse> for CompletionMetadata {
 async fn collect_stream_events<S, UserCallback, ThinkingCallback>(
   stream: &mut S,
   assistant_id: &str,
-  issuer: &Issuer,
   on_user_delta: Option<&UserCallback>,
   on_thinking_delta: Option<&ThinkingCallback>,
 ) -> Result<CollectedStream, LogError>
@@ -168,19 +165,17 @@ where
         }
         StreamEvent::End { content, .. } => match content {
           AssistantContent::Reasoning(reasoning) => {
-            if let Some(reasoning) = reasoning.open(issuer) {
-              collected.events.push(LogMessageKind::Thinking {
-                reasoning: to_stored_reasoning(reasoning),
-                parent_assistant_id: Some(assistant_id.to_owned()),
-              });
-            }
+            collected.events.push(LogMessageKind::Thinking {
+              reasoning: to_stored_reasoning(&reasoning),
+              parent_assistant_id: Some(assistant_id.to_owned()),
+            });
           }
           AssistantContent::ToolCall(tool_call) => {
             collected
               .events
               .push(tool_call_log_event(tool_call, assistant_id));
           }
-          AssistantContent::Text(_) | AssistantContent::Image(_) => {}
+          _ => {}
         },
         StreamEvent::Start { .. } | StreamEvent::Arguments { .. } => {}
       },
@@ -196,7 +191,7 @@ fn tool_call_log_event(
 ) -> LogMessageKind {
   LogMessageKind::ToolCall {
     tool_name: tool_call.function.name.to_string(),
-    arguments: tool_call.function.arguments,
+    arguments: serde_json::Value::Object(tool_call.function.arguments),
     call_id: Some(tool_call.id.to_string()),
     parent_assistant_id: Some(assistant_id.to_owned()),
     step_id: None,
@@ -257,31 +252,20 @@ fn new_message_with_id(
 }
 
 fn to_stored_reasoning(reasoning: &Reasoning) -> StoredReasoning {
+  let content = if reasoning.redacted {
+    StoredReasoningContent::Redacted {
+      data: reasoning.text.clone(),
+    }
+  } else {
+    StoredReasoningContent::Text {
+      text: reasoning.text.clone(),
+      signature: None,
+    }
+  };
   StoredReasoning {
-    id: reasoning.id.clone(),
-    content: reasoning
-      .content
-      .iter()
-      .cloned()
-      .map(to_stored_reasoning_content)
-      .collect(),
-  }
-}
-
-fn to_stored_reasoning_content(
-  content: ReasoningContent,
-) -> StoredReasoningContent {
-  match content {
-    ReasoningContent::Text { text, signature } => {
-      StoredReasoningContent::Text { text, signature }
-    }
-    ReasoningContent::Encrypted(data) => {
-      StoredReasoningContent::Encrypted(data)
-    }
-    ReasoningContent::Redacted { data } => {
-      StoredReasoningContent::Redacted { data }
-    }
-    ReasoningContent::Summary(data) => StoredReasoningContent::Summary(data),
+    id: None,
+    content: vec![content],
+    native: reasoning.native.as_ref().map(|native| native.item.clone()),
   }
 }
 
@@ -291,9 +275,11 @@ mod tests {
 
   use futures_util::stream;
   use rig_core::{
-    completion::message::{AssistantContent, ToolCall, ToolFunction},
-    message::{CallId, Issuer, ToolName},
-    streaming::{Item, StreamEvent, Transcript},
+    completion::message::{
+      AssistantContent, Reasoning, ToolCall, ToolFunction,
+    },
+    message::{CallId, ToolName},
+    streaming::{Item, StreamEvent, StreamRecord},
   };
 
   use super::{
@@ -327,12 +313,10 @@ mod tests {
       }
     };
     let items = stream_items();
-    let issuer = Issuer::new("provider");
     let mut stream = stream::iter(items.into_iter().map(Ok));
     let collected = collect_stream_events(
       &mut stream,
       "assistant",
-      &issuer,
       Some(&text_callback),
       Some(&thinking_callback),
     )
@@ -403,10 +387,11 @@ mod tests {
   }
 
   fn stream_items() -> Vec<Item<StreamEvent>> {
-    let reasoning = AssistantContent::Reasoning(
-      rig_core::completion::message::Reasoning::new("analysis")
-        .sealed(Issuer::new("provider")),
-    );
+    let reasoning = AssistantContent::Reasoning(Reasoning {
+      text: "analysis".to_owned(),
+      redacted: false,
+      native: None,
+    });
     let tool_call = AssistantContent::ToolCall(ToolCall::new(
       CallId::from_wire("call"),
       ToolFunction::new(
@@ -418,14 +403,14 @@ mod tests {
       serde_json::to_value(reasoning).expect("reasoning should serialize");
     let tool_call =
       serde_json::to_value(tool_call).expect("tool call should serialize");
-    let transcript = Transcript::parse(serde_json::json!([
+    let transcript = StreamRecord::parse(serde_json::json!([
       {"item": "event", "value": {"event": "start", "part": 0, "kind": "text"}},
       {"item": "event", "value": {"event": "text", "part": 0, "text": "hello"}},
       {"item": "event", "value": {"event": "end", "part": 0, "content": {"type": "text", "text": "hello"}}},
       {"item": "event", "value": {"event": "start", "part": 1, "kind": "reasoning"}},
       {"item": "event", "value": {"event": "reasoning", "part": 1, "text": "thinking"}},
       {"item": "event", "value": {"event": "end", "part": 1, "content": reasoning}},
-      {"item": "event", "value": {"event": "start", "part": 2, "kind": "tool_call"}},
+      {"item": "event", "value": {"event": "start", "part": 2, "kind": "tool_call", "name": "lookup"}},
       {"item": "event", "value": {"event": "end", "part": 2, "content": tool_call}}
     ]))
     .expect("transcript should be valid");

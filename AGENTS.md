@@ -7,8 +7,9 @@ Before writing code:
 1. If anything in the plan is ambiguous or violates a rule in this
    document, raise it with the user before continuing. Do not resolve
    it on your own.
-2. Create generic, reusable structures and functions.
-3. Eliminate unnecessary complexity and encapsulate complexity.
+2. Any questions you ask the user, messages to user, should be in the language of the prompt. 
+3. Create generic, reusable structures and functions.
+4. Eliminate unnecessary complexity and encapsulate complexity.
 
 Before considering the task done:
 
@@ -239,6 +240,7 @@ Always use `derive_builder` for structs with optional or validated fields, when 
 - Run `cargo clippy --all-targets -- -D warnings` to analyze the code.
 - Run `cargo doc --no-deps` to analyze the documentation.
 - Run `cargo check` to analyze the compilation. Decide for yourself if you need a parameter.
+- Run `cargo test --doc` to analyze the samples into doc.
 
 ---
 

@@ -188,6 +188,11 @@ pub struct StoredReasoning {
   pub id: Option<String>,
   /// Blocks that form the reasoning.
   pub content: Vec<StoredReasoningContent>,
+  /// Provider item the reasoning was decoded from, verbatim, when available.
+  ///
+  /// Provider-signed reasoning needs this item to be replayed unchanged.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub native: Option<serde_json::Value>,
 }
 
 /// Serializable reasoning block.
@@ -301,6 +306,7 @@ mod tests {
         },
         StoredReasoningContent::Summary("summary".to_owned()),
       ],
+      native: Some(serde_json::json!({"type": "thinking"})),
     };
 
     let serialized = serde_json::to_string(&reasoning).unwrap();
@@ -308,5 +314,6 @@ mod tests {
 
     assert_eq!(restored.content.len(), 4);
     assert_eq!(restored.id.as_deref(), Some("reasoning-1"));
+    assert!(restored.native.is_some());
   }
 }

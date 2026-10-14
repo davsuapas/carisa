@@ -107,7 +107,7 @@ impl RedisLogStorage<ConnectionManager> {
   /// # Examples
   ///
   /// ```no_run
-  /// use carisa_core::log::redis::RedisLogStorage;
+  /// use carisa_core::memory::session::redis::RedisLogStorage;
   /// use redis::Client;
   ///
   /// #[tokio::main]
@@ -126,7 +126,7 @@ impl RedisLogStorage<ConnectionManager> {
   /// # Examples
   ///
   /// ```no_run
-  /// use carisa_core::log::redis::RedisLogStorage;
+  /// use carisa_core::memory::session::redis::RedisLogStorage;
   /// use redis::Client;
   ///
   /// #[tokio::main]

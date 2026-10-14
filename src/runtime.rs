@@ -18,7 +18,7 @@
 //! use std::sync::Arc;
 //!
 //! use carisa_core::{AgentBuilder, AgentPlatformBuilder};
-//! use carisa_core::memory::log::inmemory::InMemoryLogStorage;
+//! use carisa_core::memory::session::inmemory::InMemoryLogStorage;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!   let agent = AgentBuilder::default()
