@@ -32,7 +32,7 @@ pub enum LogError {
   },
   /// Error reported by the Rig completion stream.
   #[error(transparent)]
-  Completion(#[from] rig_core::completion::CompletionError),
+  Completion(Box<rig_core::error::ProviderError>),
   /// Error joining a Tokio blocking task.
   #[error(transparent)]
   Task(#[from] tokio::task::JoinError),
@@ -54,6 +54,12 @@ pub enum LogError {
     /// Diagnostic message reported by the backend.
     message: String,
   },
+}
+
+impl From<rig_core::error::ProviderError> for LogError {
+  fn from(error: rig_core::error::ProviderError) -> Self {
+    Self::Completion(Box::new(error))
+  }
 }
 
 impl From<redis::RedisError> for LogError {

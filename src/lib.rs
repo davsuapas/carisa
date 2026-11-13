@@ -4,13 +4,22 @@
 //! by Carisa agents and orchestration layers.
 
 pub mod agent;
+pub mod identity;
 pub mod memory;
 pub mod skill;
+pub mod telemetry;
 
-pub use agent::builder::AgentBuilder;
-pub use agent::runtime::AgentRuntime;
-pub use memory::log;
+pub use agent::{
+  Agent, AgentBuilder, AgentModel, AgentPlatform,
+  AgentPlatformBuilder, PlatformError, ProviderKind, Secret
+};
+pub use identity::{AgentId, SessionId};
+pub use memory::session;
 pub use skill::{
   DomainSkill, DomainSkillBuilder, LoadSkillError, MarkdownSkillError,
-  PlatformSkill, PlatformSkillBuilder, Skill, SkillMetadata,
+  PlatformSkill, PlatformSkillBuilder, SkillMetadata,
+};
+pub use telemetry::{
+  FieldValue, MemorySink, RetryPolicy, SinkError, Telemetry, TelemetryBuilder,
+  TelemetryError, TraceLevel, TraceRecord, TraceSink,
 };

@@ -4,6 +4,7 @@
 //! core metadata and a body containing the instructions. The parser validates
 //! the required fields and rejects empty instruction bodies.
 
+use crate::DomainSkillBuilder;
 use crate::skill::error::MarkdownSkillError;
 use crate::skill::types::DomainSkill;
 
@@ -217,13 +218,20 @@ impl DomainSkill {
       });
     }
 
-    Ok(Self {
-      id,
-      title,
-      description,
-      instructions: body_trimmed.to_owned(),
-      version,
-    })
+    let skill = DomainSkillBuilder::default()
+      .id(id.clone())
+      .title(title.clone())
+      .description(description)
+      .instructions(body_trimmed.to_owned())
+      .version(version)
+      .build()
+      .map_err(|e| MarkdownSkillError::DomainSkillBuilder {
+        id: id.clone(),
+        title: title.clone(),
+        msg: e.to_string(),
+      })?;
+
+    Ok(skill)
   }
 }
 

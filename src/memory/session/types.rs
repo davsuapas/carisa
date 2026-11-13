@@ -4,12 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::identity::{AgentId, SessionId};
+
 /// Unique identifier of a persisted message.
 pub type MessageId = String;
-/// Identifier of the agent that owns a session.
-pub type AgentId = String;
-/// Identifier of an agent session.
-pub type SessionId = String;
 /// Timestamp expressed as milliseconds since the Unix epoch.
 pub type TimestampMillis = i64;
 
@@ -125,6 +123,8 @@ pub enum LogMessageKind {
     tool_name: String,
     /// Tool arguments as JSON.
     arguments: serde_json::Value,
+    /// Rig call identifier used to associate its result, when available.
+    call_id: Option<String>,
     /// Mensaje asistente al que pertenece.
     parent_assistant_id: Option<MessageId>,
     /// Associated execution step.
@@ -188,6 +188,11 @@ pub struct StoredReasoning {
   pub id: Option<String>,
   /// Blocks that form the reasoning.
   pub content: Vec<StoredReasoningContent>,
+  /// Provider item the reasoning was decoded from, verbatim, when available.
+  ///
+  /// Provider-signed reasoning needs this item to be replayed unchanged.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub native: Option<serde_json::Value>,
 }
 
 /// Serializable reasoning block.
@@ -269,6 +274,24 @@ mod tests {
   }
 
   #[test]
+  fn reads_tool_calls_without_rig_call_id() {
+    let serialized = serde_json::json!({
+      "type": "tool_call",
+      "tool_name": "lookup",
+      "arguments": {},
+      "parent_assistant_id": "assistant",
+      "step_id": null
+    });
+
+    let restored: LogMessageKind = serde_json::from_value(serialized).unwrap();
+
+    assert!(matches!(
+      restored,
+      LogMessageKind::ToolCall { call_id: None, .. }
+    ));
+  }
+
+  #[test]
   fn reasoning_round_trips_all_content_shapes() {
     let reasoning = StoredReasoning {
       id: Some("reasoning-1".to_owned()),
@@ -283,6 +306,7 @@ mod tests {
         },
         StoredReasoningContent::Summary("summary".to_owned()),
       ],
+      native: Some(serde_json::json!({"type": "thinking"})),
     };
 
     let serialized = serde_json::to_string(&reasoning).unwrap();
@@ -290,5 +314,6 @@ mod tests {
 
     assert_eq!(restored.content.len(), 4);
     assert_eq!(restored.id.as_deref(), Some("reasoning-1"));
+    assert!(restored.native.is_some());
   }
 }

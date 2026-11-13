@@ -60,9 +60,10 @@ impl LogStorage for InMemoryLogStorage {
       if is_condensation || partitions.is_empty() {
         partitions.push(Vec::new());
       }
-      let partition = partitions.last_mut().ok_or_else(|| LogError::Internal {
-        message: "active session has no partition".to_owned(),
-      })?;
+      let partition =
+        partitions.last_mut().ok_or_else(|| LogError::Internal {
+          message: "active session has no partition".to_owned(),
+        })?;
       partition.push(message);
     }
 
@@ -426,12 +427,7 @@ mod tests {
       .expect("append should work");
     let payloads = cold.messages("agent", "session").expect("read should work");
     assert_eq!(payloads.len(), 1);
-    assert!(
-      !payloads
-        .first()
-        .expect("one payload should exist")
-        .is_empty()
-    );
+    assert_ne!(payloads.first().expect("one payload should exist").len(), 0);
 
     let archived = SessionMeta {
       agent_id: "agent".to_owned(),

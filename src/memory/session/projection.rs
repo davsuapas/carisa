@@ -1,14 +1,15 @@
 //! Projection of persisted logs into provider-agnostic messages.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use rig_core::completion::{
   Message,
   message::{
-    AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolCallId,
+    AssistantContent, AssistantMessage, Reasoning, Text, ToolCall,
     ToolFunction, ToolResult, ToolResultContent, UserContent,
   },
 };
+use rig_core::message::{CallId, ToolName};
 
 use super::types::{
   LogMessage, LogMessageKind, StoredReasoning, StoredReasoningContent,
@@ -70,54 +71,29 @@ impl Default for ProjectionOptions {
 /// LogMessage(Thinking { reasoning: ... })
 ///                 |
 ///                 v
-/// Message::Assistant {
+/// Message::Assistant(AssistantMessage {
 ///   content: [Text("I will search"), ToolCall(...), Reasoning(...)],
-/// }
+/// })
 /// ```
 struct PendingAssistant {
   id: String,
-  content: String,
+  content: Vec<AssistantContent>,
   provider: Option<String>,
-  provider_response_id: Option<String>,
-  tool_calls: Vec<ToolCall>,
-  reasoning: Vec<StoredReasoning>,
 }
 
 impl PendingAssistant {
-  const fn new(
-    id: String,
-    content: String,
-    provider: Option<String>,
-    provider_response_id: Option<String>,
-  ) -> Self {
+  fn new(id: String, content: String, provider: Option<String>) -> Self {
     Self {
       id,
-      content,
+      content: vec![AssistantContent::Text(Text::new(content))],
       provider,
-      provider_response_id,
-      tool_calls: Vec::new(),
-      reasoning: Vec::new(),
     }
   }
 }
 
 impl From<PendingAssistant> for Message {
   fn from(pending: PendingAssistant) -> Self {
-    let mut content = vec![AssistantContent::Text(Text::new(pending.content))];
-    content.extend(
-      pending
-        .tool_calls
-        .into_iter()
-        .map(AssistantContent::ToolCall),
-    );
-    content.extend(pending.reasoning.into_iter().map(|reasoning| {
-      AssistantContent::Reasoning(to_rig_reasoning(reasoning))
-    }));
-
-    Self::Assistant {
-      id: pending.provider_response_id,
-      content,
-    }
+    Self::Assistant(AssistantMessage::new(pending.content))
   }
 }
 
@@ -141,9 +117,8 @@ impl From<PendingAssistant> for Message {
 ///    `parent_assistant_id` matches the `Assistant` record's id. A call with
 ///    no corresponding assistant is discarded.
 /// 3. A `Thinking` record follows the same parent rule and also passes through
-///    `ProjectionOptions::thinking_policy`. The relative order of calls and
-///    reasoning records is preserved while they are accumulated, although Rig
-///    represents them as blocks within the same assistant message.
+///    `ProjectionOptions::thinking_policy`. Accepted calls and reasoning
+///    blocks retain their input order within the assistant message.
 /// 4. A `User`, `ToolResult`, or second `Assistant` record closes the pending
 ///    group before emitting its own message. Internal events (`Turn`, `Step`,
 ///    and `Condensation`) do not produce Rig messages.
@@ -161,9 +136,9 @@ impl From<PendingAssistant> for Message {
 /// is conceptually converted into:
 ///
 /// ```text
-/// Message::Assistant {
+/// Message::Assistant(AssistantMessage {
 ///   content: [Text("I am searching for data"), ToolCall(...), Reasoning(...)],
-/// }
+/// })
 /// Message::User {
 ///   content: [ToolResult(call=call-1, text="{\"ok\":true}")],
 /// }
@@ -182,6 +157,7 @@ pub fn project_to_rig_messages(
 ) -> Vec<Message> {
   let mut projected = Vec::new();
   let mut pending = None;
+  let mut tool_names = HashMap::new();
 
   for log in logs {
     let LogMessage { id, kind, .. } = log;
@@ -193,22 +169,15 @@ pub fn project_to_rig_messages(
         });
       }
       LogMessageKind::Assistant {
-        content,
-        provider,
-        provider_response_id,
-        ..
+        content, provider, ..
       } => {
         flush_pending(&mut projected, &mut pending);
-        pending = Some(PendingAssistant::new(
-          id,
-          content,
-          provider,
-          provider_response_id,
-        ));
+        pending = Some(PendingAssistant::new(id, content, provider));
       }
       LogMessageKind::ToolCall {
         tool_name,
         arguments,
+        call_id,
         parent_assistant_id,
         ..
       } => {
@@ -218,10 +187,15 @@ pub fn project_to_rig_messages(
         if parent_assistant_id.as_deref() != Some(current.id.as_str()) {
           continue;
         }
-        current.tool_calls.push(ToolCall::new(
-          ToolCallId::new_or_mint(id),
-          ToolFunction::new(tool_name, arguments),
-        ));
+        let tool_name = to_rig_tool_name(tool_name);
+        let call_id = CallId::from_wire(call_id.unwrap_or(id));
+        tool_names.insert(call_id.to_string(), tool_name.clone());
+        current
+          .content
+          .push(AssistantContent::ToolCall(ToolCall::new(
+            call_id,
+            ToolFunction::new(tool_name, arguments),
+          )));
       }
       LogMessageKind::Thinking {
         reasoning,
@@ -234,7 +208,7 @@ pub fn project_to_rig_messages(
         if allowed
           && parent_assistant_id.as_deref() == Some(current.id.as_str())
         {
-          current.reasoning.push(reasoning);
+          current.content.push(to_rig_reasoning(reasoning));
         }
       }
       LogMessageKind::ToolResult {
@@ -252,12 +226,16 @@ pub fn project_to_rig_messages(
         } else {
           result.to_string()
         };
+        let name = tool_names
+          .get(&tool_call_id)
+          .cloned()
+          .unwrap_or_else(default_tool_name);
         projected.push(Message::User {
           content: vec![UserContent::ToolResult(ToolResult {
-            call: ToolCallId::new_or_mint(tool_call_id),
-            provider: None,
-            name: String::new(),
+            call: CallId::from_wire(tool_call_id),
+            name,
             content: vec![ToolResultContent::Text(Text::new(text))],
+            is_error,
           })],
         });
       }
@@ -269,6 +247,19 @@ pub fn project_to_rig_messages(
 
   flush_pending(&mut projected, &mut pending);
   projected
+}
+
+fn to_rig_tool_name(name: String) -> ToolName {
+  ToolName::new(name).unwrap_or_else(|_| default_tool_name())
+}
+
+#[expect(
+  clippy::expect_used,
+  reason = "the fallback name is a non-empty literal"
+)]
+fn default_tool_name() -> ToolName {
+  ToolName::new("unknown")
+    .expect("the fallback tool name is guaranteed to be non-empty")
 }
 
 fn include_thinking(
@@ -294,38 +285,35 @@ fn flush_pending(
   projected.push(pending.into());
 }
 
-fn to_rig_reasoning(reasoning: StoredReasoning) -> Reasoning {
-  Reasoning {
-    id: reasoning.id,
-    content: reasoning
-      .content
-      .into_iter()
-      .map(to_rig_reasoning_content)
-      .collect(),
+fn to_rig_reasoning(reasoning: StoredReasoning) -> AssistantContent {
+  let StoredReasoning {
+    content, native, ..
+  } = reasoning;
+  let mut text = String::new();
+  let mut redacted = false;
+  for block in content {
+    match block {
+      StoredReasoningContent::Text { text: visible, .. }
+      | StoredReasoningContent::Summary(visible) => text.push_str(&visible),
+      StoredReasoningContent::Encrypted(_)
+      | StoredReasoningContent::Redacted { .. } => redacted = true,
+    }
   }
-}
-
-fn to_rig_reasoning_content(
-  content: StoredReasoningContent,
-) -> ReasoningContent {
-  match content {
-    StoredReasoningContent::Text { text, signature } => {
-      ReasoningContent::Text { text, signature }
-    }
-    StoredReasoningContent::Encrypted(data) => {
-      ReasoningContent::Encrypted(data)
-    }
-    StoredReasoningContent::Redacted { data } => {
-      ReasoningContent::Redacted { data }
-    }
-    StoredReasoningContent::Summary(data) => ReasoningContent::Summary(data),
+  let block = AssistantContent::Reasoning(Reasoning {
+    text,
+    redacted,
+    native: None,
+  });
+  match native {
+    Some(item) => block.with_native(item),
+    None => block,
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::memory::log::types::{AgentId, SessionId, now_millis};
+  use crate::memory::session::types::{AgentId, SessionId, now_millis};
 
   fn assistant(id: &str, provider: Option<&str>) -> LogMessage {
     message(
@@ -359,6 +347,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({"key": "value"}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -371,6 +360,7 @@ mod tests {
             content: vec![StoredReasoningContent::Summary(
               "summary".to_owned(),
             )],
+            native: None,
           },
           parent_assistant_id: Some("assistant".to_owned()),
         },
@@ -382,9 +372,10 @@ mod tests {
 
     let projected = project_to_rig_messages(logs, &options);
 
-    let Some(Message::Assistant { content, .. }) = projected.first() else {
+    let Some(Message::Assistant(assistant)) = projected.first() else {
       return;
     };
+    let content = &assistant.content;
     assert!(matches!(content.first(), Some(AssistantContent::Text(_))));
     assert!(matches!(
       content.get(1),
@@ -404,6 +395,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("missing".to_owned()),
           step_id: None,
         },
@@ -443,6 +435,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -455,6 +448,7 @@ mod tests {
             content: vec![StoredReasoningContent::Summary(
               "discarded".to_owned(),
             )],
+            native: None,
           },
           parent_assistant_id: Some("assistant".to_owned()),
         },
@@ -469,9 +463,10 @@ mod tests {
       },
     );
 
-    let Some(Message::Assistant { content, .. }) = projected.first() else {
+    let Some(Message::Assistant(assistant)) = projected.first() else {
       panic!("expected an assistant message");
     };
+    let content = &assistant.content;
     assert_eq!(content.len(), 1);
     assert!(matches!(content.first(), Some(AssistantContent::Text(_))));
   }
@@ -485,6 +480,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("other-assistant".to_owned()),
           step_id: None,
         },
@@ -494,9 +490,10 @@ mod tests {
     let projected =
       project_to_rig_messages(logs, &ProjectionOptions::default());
 
-    let Some(Message::Assistant { content, .. }) = projected.first() else {
+    let Some(Message::Assistant(assistant)) = projected.first() else {
       panic!("expected an assistant message");
     };
+    let content = &assistant.content;
     assert_eq!(content.len(), 1);
     assert!(matches!(content.first(), Some(AssistantContent::Text(_))));
   }
@@ -518,8 +515,8 @@ mod tests {
       project_to_rig_messages(logs, &ProjectionOptions::default());
 
     assert_eq!(projected.len(), 3);
-    assert!(matches!(projected.first(), Some(Message::Assistant { .. })));
-    assert!(matches!(projected.get(1), Some(Message::Assistant { .. })));
+    assert!(matches!(projected.first(), Some(Message::Assistant(_))));
+    assert!(matches!(projected.get(1), Some(Message::Assistant(_))));
     assert!(matches!(projected.get(2), Some(Message::User { .. })));
   }
 
@@ -543,6 +540,52 @@ mod tests {
   }
 
   #[test]
+  fn preserves_tool_identity_and_name_for_its_result() {
+    let logs = vec![
+      assistant("assistant", Some("provider")),
+      message(
+        "tool-message",
+        LogMessageKind::ToolCall {
+          tool_name: "lookup".to_owned(),
+          arguments: serde_json::json!({"key": "value"}),
+          call_id: Some("rig-call".to_owned()),
+          parent_assistant_id: Some("assistant".to_owned()),
+          step_id: None,
+        },
+      ),
+      message(
+        "result",
+        LogMessageKind::ToolResult {
+          tool_call_id: "rig-call".to_owned(),
+          result: serde_json::json!({"found": true}),
+          is_error: false,
+          error_message: None,
+        },
+      ),
+    ];
+
+    let projected =
+      project_to_rig_messages(logs, &ProjectionOptions::default());
+
+    let Some(Message::Assistant(assistant)) = projected.first() else {
+      panic!("expected an assistant message");
+    };
+    let content = &assistant.content;
+    let Some(AssistantContent::ToolCall(call)) = content.get(1) else {
+      panic!("expected the assistant tool call");
+    };
+    assert_eq!(call.id.to_string(), "rig-call");
+    let Some(Message::User { content }) = projected.get(1) else {
+      panic!("expected a tool result message");
+    };
+    let Some(UserContent::ToolResult(result)) = content.first() else {
+      panic!("expected a projected tool result");
+    };
+    assert_eq!(result.call.to_string(), "rig-call");
+    assert_eq!(result.name.as_str(), "lookup");
+  }
+
+  #[test]
   fn preserves_input_order_for_tool_result_before_assistant() {
     let logs = vec![
       message(
@@ -562,7 +605,7 @@ mod tests {
 
     assert_eq!(projected.len(), 2);
     assert!(matches!(projected.first(), Some(Message::User { .. })));
-    assert!(matches!(projected.get(1), Some(Message::Assistant { .. })));
+    assert!(matches!(projected.get(1), Some(Message::Assistant(_))));
   }
 
   #[test]
@@ -580,6 +623,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -590,14 +634,15 @@ mod tests {
       project_to_rig_messages(logs, &ProjectionOptions::default());
 
     assert_eq!(projected.len(), 2);
-    let Some(Message::Assistant { content, .. }) = projected.first() else {
+    let Some(Message::Assistant(assistant)) = projected.first() else {
       panic!("expected an assistant message");
     };
+    let content = &assistant.content;
     assert_eq!(content.len(), 1);
   }
 
   #[test]
-  fn groups_interleaved_tools_and_thinking_by_content_type() {
+  fn preserves_order_of_interleaved_tools_and_thinking() {
     let logs = vec![
       assistant("assistant", Some("provider")),
       message(
@@ -606,6 +651,7 @@ mod tests {
           reasoning: StoredReasoning {
             id: None,
             content: vec![StoredReasoningContent::Summary("first".to_owned())],
+            native: None,
           },
           parent_assistant_id: Some("assistant".to_owned()),
         },
@@ -615,6 +661,7 @@ mod tests {
         LogMessageKind::ToolCall {
           tool_name: "lookup".to_owned(),
           arguments: serde_json::json!({}),
+          call_id: None,
           parent_assistant_id: Some("assistant".to_owned()),
           step_id: None,
         },
@@ -625,6 +672,7 @@ mod tests {
           reasoning: StoredReasoning {
             id: None,
             content: vec![StoredReasoningContent::Summary("second".to_owned())],
+            native: None,
           },
           parent_assistant_id: Some("assistant".to_owned()),
         },
@@ -638,16 +686,17 @@ mod tests {
       },
     );
 
-    let Some(Message::Assistant { content, .. }) = projected.first() else {
+    let Some(Message::Assistant(assistant)) = projected.first() else {
       panic!("expected an assistant message");
     };
+    let content = &assistant.content;
     assert!(matches!(
       content.get(1),
-      Some(AssistantContent::ToolCall(_))
+      Some(AssistantContent::Reasoning(_))
     ));
     assert!(matches!(
       content.get(2),
-      Some(AssistantContent::Reasoning(_))
+      Some(AssistantContent::ToolCall(_))
     ));
     assert!(matches!(
       content.get(3),
@@ -667,6 +716,7 @@ mod tests {
             content: vec![StoredReasoningContent::Summary(
               "included".to_owned(),
             )],
+            native: None,
           },
           parent_assistant_id: Some("accepted".to_owned()),
         },
@@ -680,6 +730,7 @@ mod tests {
             content: vec![StoredReasoningContent::Summary(
               "excluded".to_owned(),
             )],
+            native: None,
           },
           parent_assistant_id: Some("rejected".to_owned()),
         },
@@ -696,20 +747,14 @@ mod tests {
     );
 
     assert_eq!(projected.len(), 2);
-    let Some(Message::Assistant {
-      content: accepted, ..
-    }) = projected.first()
-    else {
+    let Some(Message::Assistant(accepted)) = projected.first() else {
       panic!("expected the first message to be an assistant");
     };
-    let Some(Message::Assistant {
-      content: rejected, ..
-    }) = projected.get(1)
-    else {
+    let Some(Message::Assistant(rejected)) = projected.get(1) else {
       panic!("expected the second message to be an assistant");
     };
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(rejected.len(), 1);
+    assert_eq!(accepted.content.len(), 2);
+    assert_eq!(rejected.content.len(), 1);
   }
 
   #[test]
@@ -732,12 +777,13 @@ mod tests {
       ),
     ];
 
-    assert!(
-      project_to_rig_messages(Vec::new(), &ProjectionOptions::default())
-        .is_empty()
+    assert_eq!(
+      project_to_rig_messages(Vec::new(), &ProjectionOptions::default()).len(),
+      0
     );
-    assert!(
-      project_to_rig_messages(logs, &ProjectionOptions::default()).is_empty()
+    assert_eq!(
+      project_to_rig_messages(logs, &ProjectionOptions::default()).len(),
+      0
     );
   }
 
@@ -761,6 +807,7 @@ mod tests {
               },
               StoredReasoningContent::Summary("summary".to_owned()),
             ],
+            native: None,
           },
           parent_assistant_id: Some("assistant".to_owned()),
         },
@@ -774,9 +821,10 @@ mod tests {
       },
     );
 
-    let Some(Message::Assistant { content, .. }) = projected.first() else {
+    let Some(Message::Assistant(assistant)) = projected.first() else {
       panic!("expected an assistant message");
     };
+    let content = &assistant.content;
     assert!(matches!(
       content.get(1),
       Some(AssistantContent::Reasoning(_))

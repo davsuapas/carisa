@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use redis::{AsyncCommands, Client, aio::ConnectionManager};
 
-use crate::log::{
+use crate::session::{
   LogError, LogMessage, LogMessageKind, MessageId, SessionMeta,
   StoredLogMessage,
   storage::{LogStorage, SessionMetaStore},
@@ -107,7 +107,7 @@ impl RedisLogStorage<ConnectionManager> {
   /// # Examples
   ///
   /// ```no_run
-  /// use carisa_core::log::redis::RedisLogStorage;
+  /// use carisa_core::memory::session::redis::RedisLogStorage;
   /// use redis::Client;
   ///
   /// #[tokio::main]
@@ -126,7 +126,7 @@ impl RedisLogStorage<ConnectionManager> {
   /// # Examples
   ///
   /// ```no_run
-  /// use carisa_core::log::redis::RedisLogStorage;
+  /// use carisa_core::memory::session::redis::RedisLogStorage;
   /// use redis::Client;
   ///
   /// #[tokio::main]
