@@ -51,6 +51,7 @@ mod tests {
   use std::sync::Arc;
 
   use async_trait::async_trait;
+  use rig_core::completion::Message;
 
   use super::{LogError, migrate_session_to_cold};
   use crate::memory::session::{
@@ -58,41 +59,37 @@ mod tests {
       InMemoryColdStorage, InMemoryLogStorage, InMemorySessionMetaStore,
     },
     storage::{ColdStorage, LogStorage, SessionMetaStore},
-    types::{LogMessage, LogMessageKind, SessionMeta, StoredLogMessage},
+    types::{Etiqueta, LogMessage, SessionMeta, StoredLogMessage},
   };
 
   fn message(id: &str) -> LogMessage {
-    LogMessage {
-      id: id.to_owned(),
-      agent_id: "agent".to_owned(),
-      agent_nickname: "Agent".to_owned(),
-      session_id: "session".to_owned(),
-      timestamp: 1,
-      kind: LogMessageKind::User {
-        content: "hello".to_owned(),
-      },
-    }
+    LogMessage::with_id(
+      id,
+      "agent",
+      "Agent",
+      "session",
+      1,
+      Etiqueta::None,
+      Message::user("hello"),
+    )
   }
 
   fn condensation(id: &str) -> LogMessage {
-    LogMessage {
-      kind: LogMessageKind::Condensation {
-        summary: "condensed".to_owned(),
-        model_used: None,
-      },
-      ..message(id)
-    }
+    LogMessage::with_id(
+      id,
+      "agent",
+      "Agent",
+      "session",
+      1,
+      Etiqueta::Condensation,
+      Message::user("condensed"),
+    )
   }
 
   fn meta() -> SessionMeta {
-    SessionMeta {
-      agent_id: "agent".to_owned(),
-      agent_nickname: "Agent".to_owned(),
-      session_id: "session".to_owned(),
-      created_at: 1,
-      closed_at: Some(2),
-      workflow_id: None,
-    }
+    let mut meta = SessionMeta::new("agent", "Agent", "session");
+    meta.closed_at = Some(2);
+    meta
   }
 
   fn log_store(storage: Arc<InMemoryLogStorage>) -> Arc<dyn LogStorage> {
@@ -145,12 +142,12 @@ mod tests {
     .await
     .expect("second migration should work");
 
-    assert!(
+    assert_eq!(
       active
         .history("agent", "session")
         .await
-        .expect("history should work")
-        .is_empty()
+        .expect("history should work"),
+      Vec::new()
     );
     assert_eq!(
       cold

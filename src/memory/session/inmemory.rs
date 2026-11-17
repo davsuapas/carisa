@@ -3,13 +3,12 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use async_trait::async_trait;
+use rig_core::completion::Message;
 
 use super::{
   error::LogError,
   storage::{ColdStorage, LogStorage, SessionMetaStore},
-  types::{
-    LogMessage, LogMessageKind, MessageId, SessionMeta, StoredLogMessage,
-  },
+  types::{Etiqueta, LogMessage, MessageId, SessionMeta, StoredLogMessage},
 };
 
 type SessionKey = (String, String);
@@ -55,8 +54,7 @@ impl LogStorage for InMemoryLogStorage {
     let partitions = stored.entry(key).or_default();
 
     for message in messages {
-      let is_condensation =
-        matches!(&message.kind, LogMessageKind::Condensation { .. });
+      let is_condensation = message.etiqueta == Etiqueta::Condensation;
       if is_condensation || partitions.is_empty() {
         partitions.push(Vec::new());
       }
@@ -75,7 +73,7 @@ impl LogStorage for InMemoryLogStorage {
     &self,
     agent_id: &str,
     session_id: &str,
-  ) -> Result<Vec<LogMessage>, LogError> {
+  ) -> Result<Vec<Message>, LogError> {
     let key = session_key(agent_id, session_id);
     let stored = self.messages.lock().map_err(|_| LogError::Internal {
       message: "message lock poisoned".to_owned(),
@@ -86,7 +84,7 @@ impl LogStorage for InMemoryLogStorage {
       .cloned()
       .unwrap_or_default();
     drop(stored);
-    Ok(messages)
+    Ok(messages.into_iter().map(|log| log.message).collect())
   }
 
   async fn drain_next_batch(
@@ -296,16 +294,15 @@ mod tests {
   use super::*;
 
   fn message(id: &str) -> LogMessage {
-    LogMessage {
-      id: id.to_owned(),
-      agent_id: "agent".to_owned(),
-      agent_nickname: "Agent".to_owned(),
-      session_id: "session".to_owned(),
-      timestamp: 1,
-      kind: LogMessageKind::User {
-        content: id.to_owned(),
-      },
-    }
+    LogMessage::with_id(
+      id,
+      "agent",
+      "Agent",
+      "session",
+      1,
+      Etiqueta::None,
+      Message::user(id),
+    )
   }
 
   #[tokio::test]
@@ -321,23 +318,17 @@ mod tests {
       .await
       .expect("history should work");
 
-    assert_eq!(
-      history
-        .iter()
-        .map(|item| item.id.as_str())
-        .collect::<Vec<_>>(),
-      ["one", "two"]
-    );
+    assert_eq!(history, vec![Message::user("one"), Message::user("two")]);
     storage
       .delete_session("agent", "session")
       .await
       .expect("delete should work");
-    assert!(
+    assert_eq!(
       storage
         .history("agent", "session")
         .await
-        .expect("history should work")
-        .is_empty()
+        .expect("history should work"),
+      Vec::new()
     );
   }
 
@@ -350,13 +341,15 @@ mod tests {
         "session",
         vec![
           message("one"),
-          LogMessage {
-            kind: LogMessageKind::Condensation {
-              summary: "summary".to_owned(),
-              model_used: None,
-            },
-            ..message("summary")
-          },
+          LogMessage::with_id(
+            "summary",
+            "agent",
+            "Agent",
+            "session",
+            1,
+            Etiqueta::Condensation,
+            Message::user("summary"),
+          ),
           message("two"),
         ],
       )
@@ -429,14 +422,8 @@ mod tests {
     assert_eq!(payloads.len(), 1);
     assert_ne!(payloads.first().expect("one payload should exist").len(), 0);
 
-    let archived = SessionMeta {
-      agent_id: "agent".to_owned(),
-      agent_nickname: "Agent".to_owned(),
-      session_id: "session".to_owned(),
-      created_at: 1,
-      closed_at: Some(2),
-      workflow_id: None,
-    };
+    let mut archived = SessionMeta::new("agent", "Agent", "session");
+    archived.closed_at = Some(2);
     cold
       .put_meta(&archived)
       .await
@@ -450,14 +437,8 @@ mod tests {
     );
 
     let metadata = InMemorySessionMetaStore::new();
-    let meta = SessionMeta {
-      agent_id: "agent".to_owned(),
-      agent_nickname: "Agent".to_owned(),
-      session_id: "session".to_owned(),
-      created_at: 1,
-      closed_at: Some(2),
-      workflow_id: None,
-    };
+    let mut meta = SessionMeta::new("agent", "Agent", "session");
+    meta.closed_at = Some(2);
     metadata
       .put_meta(&meta)
       .await

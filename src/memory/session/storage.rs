@@ -1,6 +1,7 @@
 //! Asynchronous contracts for storing session events and metadata.
 
 use async_trait::async_trait;
+use rig_core::completion::Message;
 
 use super::{
   error::LogError,
@@ -18,15 +19,20 @@ pub trait LogStorage: Send + Sync {
     messages: Vec<LogMessage>,
   ) -> Result<Vec<MessageId>, LogError>;
 
-  /// Reads the active message context.
+  /// Reads the active message context as completion messages.
   ///
-  /// This is the context kept small by condensation: it only contains the
-  /// messages of the current partition.
+  /// The result is the conversation the next request sends, in order: it goes
+  /// straight to a completion request, and the provider's request preparation
+  /// validates and shapes it for the target model. No projection is applied
+  /// here, because the stored records already hold rig's own messages.
+  ///
+  /// The context is kept small by condensation: only the messages of the
+  /// current partition are returned.
   async fn history(
     &self,
     agent_id: &str,
     session_id: &str,
-  ) -> Result<Vec<LogMessage>, LogError>;
+  ) -> Result<Vec<Message>, LogError>;
 
   /// Reads the next batch of messages for a session, without exposing how the
   /// backend stores them internally.

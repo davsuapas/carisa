@@ -4,8 +4,10 @@
 //!
 //! Session history is stored in **per-session partitions**. Each partition is
 //! a Redis hash whose fields are message ids (ULIDs) and whose values are
-//! zstd-compressed JSON payloads. The hash acts as both index and data, so a
-//! read needs no separate index lookup.
+//! zstd-compressed JSON payloads. Each payload is a [`LogMessage`] holding one
+//! rig [`Message`] verbatim, provider items included, so a history read back
+//! can be sent to the same model unchanged. The hash acts as both index and
+//! data, so a read needs no separate index lookup.
 //!
 //! A condensation message closes the current partition and opens a new one
 //! whose first entry is that condensation. This keeps the active context
@@ -64,10 +66,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use redis::{AsyncCommands, Client, aio::ConnectionManager};
+use rig_core::completion::Message;
 
 use crate::session::{
-  LogError, LogMessage, LogMessageKind, MessageId, SessionMeta,
-  StoredLogMessage,
+  Etiqueta, LogError, LogMessage, MessageId, SessionMeta, StoredLogMessage,
   storage::{LogStorage, SessionMetaStore},
 };
 
@@ -259,8 +261,7 @@ where
       Vec::with_capacity(messages.len());
     for message in &messages {
       let id = message.id.clone();
-      let is_condensation =
-        matches!(&message.kind, LogMessageKind::Condensation { .. });
+      let is_condensation = message.etiqueta == Etiqueta::Condensation;
       let payload = self.encode_message_sized(message).await?;
       encoded.push((id, payload, is_condensation));
     }
@@ -297,7 +298,7 @@ where
     &self,
     agent_id: &str,
     session_id: &str,
-  ) -> Result<Vec<LogMessage>, LogError> {
+  ) -> Result<Vec<Message>, LogError> {
     let mut connection = self.connection.clone();
     let pointer_key = current_partition_key(agent_id, session_id);
 
@@ -327,9 +328,9 @@ where
     // `HGETALL` does not guarantee a field order, so restore the
     // chronological order explicitly. Message ids are ULIDs, whose
     // lexicographic order matches their creation order.
-    messages.sort_by_key(|message| message.id.clone());
+    messages.sort_by(|left, right| left.id.cmp(&right.id));
 
-    Ok(messages)
+    Ok(messages.into_iter().map(|log| log.message).collect())
   }
 
   async fn drain_next_batch(
@@ -367,7 +368,7 @@ where
       .into_iter()
       .map(|(id, payload)| StoredLogMessage { id, payload })
       .collect();
-    messages.sort_by_key(|message| message.id.clone());
+    messages.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(Some((batch_index.saturating_add(1), messages)))
   }
 
@@ -507,16 +508,15 @@ mod tests {
   }
 
   fn sample_message(id: &str, agent_id: &str, session_id: &str) -> LogMessage {
-    LogMessage {
-      id: id.to_owned(),
-      agent_id: agent_id.to_owned(),
-      agent_nickname: "Agent Smith".to_owned(),
-      session_id: session_id.to_owned(),
-      timestamp: 1_700_000_000_000,
-      kind: LogMessageKind::User {
-        content: "hello".to_owned(),
-      },
-    }
+    LogMessage::with_id(
+      id,
+      agent_id,
+      "Agent Smith",
+      session_id,
+      1_700_000_000_000,
+      Etiqueta::None,
+      Message::user("hello"),
+    )
   }
 
   fn sample_condensation(
@@ -524,13 +524,15 @@ mod tests {
     agent_id: &str,
     session_id: &str,
   ) -> LogMessage {
-    LogMessage {
-      kind: LogMessageKind::Condensation {
-        summary: "condensed history".to_owned(),
-        model_used: None,
-      },
-      ..sample_message(id, agent_id, session_id)
-    }
+    LogMessage::with_id(
+      id,
+      agent_id,
+      "Agent Smith",
+      session_id,
+      1_700_000_000_000,
+      Etiqueta::Condensation,
+      Message::user("condensed history"),
+    )
   }
 
   #[tokio::test]
@@ -715,12 +717,15 @@ mod tests {
     let session_id = "sess-1";
     // Long text pushes serialized JSON above a deliberately tiny
     // threshold, forcing the spawn_blocking path.
-    let message = LogMessage {
-      kind: LogMessageKind::User {
-        content: "x".repeat(200),
-      },
-      ..sample_message("01J000000000000000000002", agent_id, session_id)
-    };
+    let message = LogMessage::with_id(
+      "01J000000000000000000002",
+      agent_id,
+      "Agent Smith",
+      session_id,
+      1_700_000_000_000,
+      Etiqueta::None,
+      Message::user("x".repeat(200)),
+    );
 
     let json = serde_json::to_vec(&message).unwrap();
     assert!(
@@ -757,8 +762,6 @@ mod tests {
 
     assert_eq!(ids, vec![message.id]);
   }
-
-  // --- history -----------------------------------------------------
 
   #[tokio::test]
   async fn history_reads_active_partition_ordered_by_id() {
@@ -802,10 +805,7 @@ mod tests {
       .await
       .expect("history should succeed");
 
-    assert_eq!(
-      serde_json::to_value(history).unwrap(),
-      serde_json::to_value(vec![m1, m2]).unwrap()
-    );
+    assert_eq!(history, vec![m1.message, m2.message]);
   }
 
   #[tokio::test]
@@ -832,7 +832,7 @@ mod tests {
       .await
       .expect("history should succeed");
 
-    assert!(history.is_empty());
+    assert_eq!(history, Vec::new());
   }
 
   #[tokio::test]
@@ -877,13 +877,8 @@ mod tests {
       .await
       .expect("history should succeed even via spawn_blocking");
 
-    assert_eq!(
-      serde_json::to_value(history).unwrap(),
-      serde_json::to_value(vec![m1, m2]).unwrap()
-    );
+    assert_eq!(history, vec![m1.message, m2.message]);
   }
-
-  // --- delete_session --------------------------------------------------
 
   #[tokio::test]
   async fn drain_reads_every_partition_in_order() {
@@ -1036,14 +1031,7 @@ mod tests {
 
   #[tokio::test]
   async fn put_meta_stores_serialized_json_under_meta_key() {
-    let meta = SessionMeta {
-      agent_id: "agent-1".to_owned(),
-      agent_nickname: "Agent Smith".to_owned(),
-      session_id: "sess-1".to_owned(),
-      created_at: 1_700_000_000_000,
-      closed_at: None,
-      workflow_id: None,
-    };
+    let meta = SessionMeta::new("agent-1", "Agent Smith", "sess-1");
     let serialized = serde_json::to_string(&meta).unwrap();
     let key = meta_key(&meta.agent_id, &meta.session_id);
 

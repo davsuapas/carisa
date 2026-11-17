@@ -10,8 +10,8 @@ pub mod skill;
 pub mod telemetry;
 
 pub use agent::{
-  Agent, AgentBuilder, AgentModel, AgentPlatform,
-  AgentPlatformBuilder, PlatformError, ProviderKind, Secret
+  Agent, AgentBuilder, AgentModel, AgentPlatform, AgentPlatformBuilder,
+  PlatformError, ProviderKind, Secret,
 };
 pub use identity::{AgentId, SessionId};
 pub use memory::session;

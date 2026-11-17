@@ -1,10 +1,36 @@
 //! Serializable types that form a session log.
+//!
+//! A session log is the sequence of messages a completion model receives and
+//! produces. Each record stores a [`rig_core::completion::Message`] **exactly**
+//! as it was sent or produced, provider items included: those items are what
+//! let the same model replay a turn unchanged, which keeps signed reasoning
+//! valid and the provider's prefix cache warm. Stripping them would make rig
+//! rebuild the turn from its canonical fields, changing the request prefix.
+//!
+//! [`LogMessage`] adds the identity a storage backend needs (a ULID, the
+//! owning agent and session, a timestamp) and an [`Etiqueta`] that marks the
+//! two records the session machinery writes on its own: the preamble and the
+//! condensation summary. Everything else is part of the conversation.
+//!
+//! Reading a session returns the stored messages as they are; converting them
+//! to a request ([`rig_core::completion::CompletionRequest`]) lets rig validate
+//! and shape them for the target model. No projection of our own is needed.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rig_core::completion::Message;
 use serde::{Deserialize, Serialize};
 
 pub use crate::identity::{AgentId, SessionId};
+
+/// Minor version of `rig-core` whose message format this build stores.
+///
+/// The serialized shape of [`Message`] is not part of rig's stability
+/// promise: variants get renamed or removed between minors. A session log
+/// records the version it was written with so a reader can tell whether the
+/// stored messages are still readable by this build. Bump this value together
+/// with the `rig-core` dependency in `Cargo.toml`.
+pub const RIG_CORE_VERSION: &str = "0.46";
 
 /// Unique identifier of a persisted message.
 pub type MessageId = String;
@@ -24,7 +50,33 @@ pub struct StoredLogMessage {
   pub payload: Vec<u8>,
 }
 
-/// Structured message stored in a session log.
+/// Label for the records the session machinery writes on its own.
+///
+/// It is stored apart from the message so a backend can decide where a
+/// partition starts without decoding the payload.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Etiqueta {
+  /// Message that belongs to the conversation itself.
+  None,
+  /// System prompt the agent sends ahead of the conversation.
+  ///
+  /// Stored once, as a [`Message::System`], so a history read back starts
+  /// with it.
+  Preamble,
+  /// Summary that condenses the history before it.
+  ///
+  /// Stored as a [`Message::User`] so no model wire moves or joins it, and
+  /// used by the storage backend to open a new partition.
+  Condensation,
+}
+
+/// Message stored in a session log.
+///
+/// The payload is the rig message exactly as it was sent or produced,
+/// including the provider items that a model needs to replay its own turns
+/// unchanged.
 #[non_exhaustive]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LogMessage {
@@ -38,184 +90,97 @@ pub struct LogMessage {
   pub session_id: SessionId,
   /// Message creation time.
   pub timestamp: TimestampMillis,
-  /// Event-specific data.
-  pub kind: LogMessageKind,
+  /// Whether the record belongs to the conversation or was written by the
+  /// session machinery.
+  pub etiqueta: Etiqueta,
+  /// Message sent to, or produced by, the completion model.
+  pub message: Message,
 }
 
-/// Data-free mirror of `LogMessageKind`, stored uncompressed so a
-/// future search/filter trait can filter
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum LogMessageKindTag {
-  /// User message.
-  User = 0,
-  /// Assistant message.
-  Assistant = 1,
-  /// Assistant reasoning.
-  Thinking = 2,
-  /// Tool invocation.
-  ToolCall = 3,
-  /// Tool result.
-  ToolResult = 4,
-  /// Turn boundary.
-  Turn = 5,
-  /// Internal step.
-  Step = 6,
-  /// Condensed history.
-  Condensation = 7,
-}
-
-impl LogMessageKindTag {
-  /// Returns the stable byte representation of this tag.
-  pub const fn as_u8(self) -> u8 {
-    self as u8
+impl LogMessage {
+  /// A conversation message, labeled [`Etiqueta::None`].
+  #[must_use]
+  pub fn new(agent_id: &str, session_id: &str, message: Message) -> Self {
+    Self::labeled(agent_id, session_id, Etiqueta::None, message)
   }
 
-  /// Kept for the future search/filter trait, even though nothing
-  /// calls it yet.
-  pub const fn try_from_u8(value: u8) -> Option<Self> {
-    match value {
-      0 => Some(Self::User),
-      1 => Some(Self::Assistant),
-      2 => Some(Self::Thinking),
-      3 => Some(Self::ToolCall),
-      4 => Some(Self::ToolResult),
-      5 => Some(Self::Turn),
-      6 => Some(Self::Step),
-      7 => Some(Self::Condensation),
-      _ => None,
-    }
+  /// The agent's preamble, stored once as a system message.
+  #[must_use]
+  pub fn preamble(
+    agent_id: &str,
+    session_id: &str,
+    content: impl Into<String>,
+  ) -> Self {
+    Self::labeled(
+      agent_id,
+      session_id,
+      Etiqueta::Preamble,
+      Message::system(content),
+    )
   }
-}
 
-/// Event variants that can be part of a session history.
-#[non_exhaustive]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LogMessageKind {
-  /// Entry written by the user.
-  User {
-    /// Text written by the user.
-    content: String,
-  },
-  /// Text response from the assistant.
-  Assistant {
-    /// Text generated by the assistant.
-    content: String,
-    /// Provider that generated the response.
-    provider: Option<String>,
-    /// Model that generated the response.
-    model: Option<String>,
-    /// Provider response identifier.
-    provider_response_id: Option<String>,
-  },
-  /// Reasoning associated with an assistant response.
-  Thinking {
-    /// Reasoning content.
-    reasoning: StoredReasoning,
-    /// Assistant message that owns this reasoning.
-    parent_assistant_id: Option<MessageId>,
-  },
-  /// Tool call requested by the assistant.
-  ToolCall {
-    /// Tool name.
-    tool_name: String,
-    /// Tool arguments as JSON.
-    arguments: serde_json::Value,
-    /// Rig call identifier used to associate its result, when available.
-    call_id: Option<String>,
-    /// Mensaje asistente al que pertenece.
-    parent_assistant_id: Option<MessageId>,
-    /// Associated execution step.
-    step_id: Option<MessageId>,
-  },
-  /// Result produced by a tool call.
-  ToolResult {
-    /// Identifier of the related call message.
-    tool_call_id: MessageId,
-    /// Tool result as JSON.
-    result: serde_json::Value,
-    /// Whether the tool finished with an error.
-    is_error: bool,
-    /// Human-readable error description, if any.
-    error_message: Option<String>,
-  },
-  /// Logical start or end of a turn.
-  Turn {
-    /// Turn number.
-    turn_number: u32,
-  },
-  /// Internal step of a turn.
-  Step {
-    /// Step number within the turn.
-    step_number: u32,
-    /// Parent turn identifier.
-    turn_id: MessageId,
-  },
-  /// Summary generated while condensing the history.
-  Condensation {
-    /// Summary text.
-    summary: String,
-    /// Model that generated the summary.
-    model_used: Option<String>,
-  },
-}
-
-impl LogMessageKind {
-  // Kept for the future search/filter trait, even though nothing
-  // calls it yet.
-  /// Returns the data-free tag for this event kind.
-  pub const fn tag(&self) -> LogMessageKindTag {
-    match self {
-      Self::User { .. } => LogMessageKindTag::User,
-      Self::Assistant { .. } => LogMessageKindTag::Assistant,
-      Self::Thinking { .. } => LogMessageKindTag::Thinking,
-      Self::ToolCall { .. } => LogMessageKindTag::ToolCall,
-      Self::ToolResult { .. } => LogMessageKindTag::ToolResult,
-      Self::Turn { .. } => LogMessageKindTag::Turn,
-      Self::Step { .. } => LogMessageKindTag::Step,
-      Self::Condensation { .. } => LogMessageKindTag::Condensation,
-    }
-  }
-}
-
-/// Provider-independent representation of generated reasoning.
-#[non_exhaustive]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StoredReasoning {
-  /// Optional identifier assigned by the provider.
-  pub id: Option<String>,
-  /// Blocks that form the reasoning.
-  pub content: Vec<StoredReasoningContent>,
-  /// Provider item the reasoning was decoded from, verbatim, when available.
+  /// A condensation summary, stored as a user message.
   ///
-  /// Provider-signed reasoning needs this item to be replayed unchanged.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub native: Option<serde_json::Value>,
-}
+  /// The storage backend opens a new partition with it.
+  #[must_use]
+  pub fn condensation(
+    agent_id: &str,
+    session_id: &str,
+    summary: impl Into<String>,
+  ) -> Self {
+    Self::labeled(
+      agent_id,
+      session_id,
+      Etiqueta::Condensation,
+      Message::user(summary),
+    )
+  }
 
-/// Serializable reasoning block.
-#[non_exhaustive]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-pub enum StoredReasoningContent {
-  /// Visible reasoning text.
-  Text {
-    /// Text content.
-    text: String,
-    /// Optional provider signature.
-    signature: Option<String>,
-  },
-  /// Opaque encrypted content.
-  Encrypted(String),
-  /// Content redacted by the provider.
-  Redacted {
-    /// Data preserved opaquely.
-    data: String,
-  },
-  /// Reasoning summary.
-  Summary(String),
+  /// Sets the agent display name recorded with the message.
+  #[must_use]
+  pub fn with_agent_nickname(mut self, nickname: impl Into<String>) -> Self {
+    self.agent_nickname = nickname.into();
+    self
+  }
+
+  fn labeled(
+    agent_id: &str,
+    session_id: &str,
+    etiqueta: Etiqueta,
+    message: Message,
+  ) -> Self {
+    Self {
+      id: generate_message_id(),
+      agent_id: agent_id.to_owned(),
+      agent_nickname: String::new(),
+      session_id: session_id.to_owned(),
+      timestamp: now_millis(),
+      etiqueta,
+      message,
+    }
+  }
+
+  /// A message with the given identity, for deterministic tests.
+  #[cfg(test)]
+  pub(crate) fn with_id(
+    id: impl Into<MessageId>,
+    agent_id: &str,
+    agent_nickname: &str,
+    session_id: &str,
+    timestamp: TimestampMillis,
+    etiqueta: Etiqueta,
+    message: Message,
+  ) -> Self {
+    Self {
+      id: id.into(),
+      agent_id: agent_id.to_owned(),
+      agent_nickname: agent_nickname.to_owned(),
+      session_id: session_id.to_owned(),
+      timestamp,
+      etiqueta,
+      message,
+    }
+  }
 }
 
 /// Persistent metadata for a session.
@@ -234,6 +199,30 @@ pub struct SessionMeta {
   pub closed_at: Option<TimestampMillis>,
   /// External workflow identifier, if any.
   pub workflow_id: Option<String>,
+  /// Minor version of `rig-core` the session log was written with.
+  ///
+  /// Compare it with [`RIG_CORE_VERSION`] before replaying a stored history:
+  /// a log written by another minor may not deserialize with this build.
+  /// Session records written before this field existed read as empty.
+  #[serde(default)]
+  pub rig_version: String,
+}
+
+impl SessionMeta {
+  /// Metadata for a new session, stamped with the running `rig-core`
+  /// version.
+  #[must_use]
+  pub fn new(agent_id: &str, agent_nickname: &str, session_id: &str) -> Self {
+    Self {
+      agent_id: agent_id.to_owned(),
+      agent_nickname: agent_nickname.to_owned(),
+      session_id: session_id.to_owned(),
+      created_at: now_millis(),
+      closed_at: None,
+      workflow_id: None,
+      rig_version: RIG_CORE_VERSION.to_owned(),
+    }
+  }
 }
 
 /// Generates a ULID for a new message.
@@ -256,64 +245,89 @@ pub fn now_millis() -> TimestampMillis {
 
 #[cfg(test)]
 mod tests {
+  use rig_core::completion::message::{AssistantContent, AssistantMessage};
+  use rstest::rstest;
+
   use super::*;
 
-  #[test]
-  fn message_kind_round_trips_as_tagged_json() {
-    let kind = LogMessageKind::ToolResult {
-      tool_call_id: "call-1".to_owned(),
-      result: serde_json::json!({"ok": true}),
-      is_error: false,
-      error_message: None,
-    };
+  fn provider_item() -> serde_json::Value {
+    serde_json::json!({"type": "text", "text": "hello", "provider": "item"})
+  }
 
-    let serialized = serde_json::to_string(&kind).unwrap();
-    let restored: LogMessageKind = serde_json::from_str(&serialized).unwrap();
-
-    assert!(matches!(restored, LogMessageKind::ToolResult { .. }));
+  fn assistant_with_provider_item() -> Message {
+    let text = AssistantContent::text("hello").with_native(provider_item());
+    Message::Assistant(AssistantMessage::new(vec![text]))
   }
 
   #[test]
-  fn reads_tool_calls_without_rig_call_id() {
-    let serialized = serde_json::json!({
-      "type": "tool_call",
-      "tool_name": "lookup",
-      "arguments": {},
-      "parent_assistant_id": "assistant",
-      "step_id": null
-    });
+  fn log_message_round_trips_provider_items() {
+    let log =
+      LogMessage::new("agent", "session", assistant_with_provider_item());
 
-    let restored: LogMessageKind = serde_json::from_value(serialized).unwrap();
+    let serialized = serde_json::to_string(&log).expect("serialize");
+    let restored: LogMessage =
+      serde_json::from_str(&serialized).expect("deserialize");
 
-    assert!(matches!(
-      restored,
-      LogMessageKind::ToolCall { call_id: None, .. }
-    ));
+    let Message::Assistant(turn) = &restored.message else {
+      panic!("expected an assistant message");
+    };
+    let block = turn.content.first().expect("one block should exist");
+    assert_eq!(block.native_item(), Some(&provider_item()));
   }
 
   #[test]
-  fn reasoning_round_trips_all_content_shapes() {
-    let reasoning = StoredReasoning {
-      id: Some("reasoning-1".to_owned()),
-      content: vec![
-        StoredReasoningContent::Text {
-          text: "analysis".to_owned(),
-          signature: Some("signature".to_owned()),
-        },
-        StoredReasoningContent::Encrypted("ciphertext".to_owned()),
-        StoredReasoningContent::Redacted {
-          data: "redacted".to_owned(),
-        },
-        StoredReasoningContent::Summary("summary".to_owned()),
-      ],
-      native: Some(serde_json::json!({"type": "thinking"})),
-    };
+  fn condensation_is_a_user_message() {
+    let log = LogMessage::condensation("agent", "session", "summary");
 
-    let serialized = serde_json::to_string(&reasoning).unwrap();
-    let restored: StoredReasoning = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(log.etiqueta, Etiqueta::Condensation);
+    assert!(matches!(log.message, Message::User { .. }));
+  }
 
-    assert_eq!(restored.content.len(), 4);
-    assert_eq!(restored.id.as_deref(), Some("reasoning-1"));
-    assert!(restored.native.is_some());
+  #[test]
+  fn preamble_is_a_system_message() {
+    let log = LogMessage::preamble("agent", "session", "system prompt");
+
+    assert_eq!(log.etiqueta, Etiqueta::Preamble);
+    assert!(matches!(log.message, Message::System { .. }));
+  }
+
+  #[test]
+  fn new_stamps_identity_and_etiqueta() {
+    let log = LogMessage::new("agent", "session", Message::user("hi"));
+
+    assert_eq!(log.agent_id, "agent");
+    assert_eq!(log.session_id, "session");
+    assert_eq!(log.etiqueta, Etiqueta::None);
+    assert!(log.timestamp > 0);
+    assert_eq!(log.id.len(), 26);
+  }
+
+  #[test]
+  fn new_session_meta_records_the_rig_version() {
+    let meta = SessionMeta::new("agent", "Agent", "session");
+
+    assert_eq!(meta.rig_version, RIG_CORE_VERSION);
+    assert_eq!(meta.closed_at, None);
+  }
+
+  #[rstest]
+  #[case::stored_version(
+    r#"{"agent_id":"agent","agent_nickname":"Agent","session_id":"session",
+    "created_at":1,"closed_at":null,"workflow_id":null,
+    "rig_version":"0.46"}"#,
+    "0.46"
+  )]
+  #[case::legacy_without_version(
+    r#"{"agent_id":"agent","agent_nickname":"Agent","session_id":"session",
+    "created_at":1,"closed_at":null,"workflow_id":null}"#,
+    ""
+  )]
+  fn session_meta_reads_stored_and_legacy_json(
+    #[case] json: &str,
+    #[case] expected_version: &str,
+  ) {
+    let meta: SessionMeta = serde_json::from_str(json).expect("deserialize");
+
+    assert_eq!(meta.rig_version, expected_version);
   }
 }
