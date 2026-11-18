@@ -220,8 +220,8 @@ mod tests {
       _: &str,
       _: Vec<StoredLogMessage>,
     ) -> Result<(), LogError> {
-      Err(LogError::Backend {
-        message: "cold backend failed".to_owned(),
+      Err(LogError::Storage {
+        source: Box::new(std::io::Error::other("cold backend failed")),
       })
     }
 

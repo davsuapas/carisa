@@ -6,11 +6,12 @@ use thiserror::Error as ThisError;
 #[non_exhaustive]
 #[derive(Debug, ThisError)]
 pub enum LogError {
-  /// Error returned by the Redis backend.
-  #[error("Redis backend error: {message}")]
-  Redis {
-    /// Diagnostic message returned by the backend.
-    message: String,
+  /// Error reported by a storage backend.
+  #[error("storage backend error: {source}")]
+  Storage {
+    /// Original error returned by the backend.
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync>,
   },
   /// Error while serializing or deserializing JSON.
   #[error("JSON error: {message}")]
@@ -48,12 +49,6 @@ pub enum LogError {
     /// Description of the violated invariant.
     message: String,
   },
-  /// An error reported by a storage backend during a log operation.
-  #[error("log storage error: {message}")]
-  Backend {
-    /// Diagnostic message reported by the backend.
-    message: String,
-  },
 }
 
 impl From<rig_core::error::ProviderError> for LogError {
@@ -62,18 +57,29 @@ impl From<rig_core::error::ProviderError> for LogError {
   }
 }
 
-impl From<redis::RedisError> for LogError {
-  fn from(error: redis::RedisError) -> Self {
-    Self::Redis {
-      message: error.to_string(),
-    }
-  }
-}
-
 impl From<serde_json::Error> for LogError {
   fn from(error: serde_json::Error) -> Self {
     Self::Json {
       message: error.to_string(),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::error::Error;
+
+  use super::LogError;
+
+  #[test]
+  fn storage_error_exposes_its_source() {
+    let error = LogError::Storage {
+      source: Box::new(std::io::Error::other("backend unavailable")),
+    };
+
+    assert_eq!(
+      error.source().map(ToString::to_string).as_deref(),
+      Some("backend unavailable"),
+    );
   }
 }

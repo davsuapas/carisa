@@ -28,25 +28,28 @@
 //! meta:{agent_id}:{session_id}                       JSON SessionMeta
 //! ```
 //!
-//! Partitions are numbered from `0` (`INITIAL_PARTITION`).
+//! Partition `0` (`INITIAL_PARTITION`) holds the optional preamble. Conversation
+//! messages start in partition `1`; condensations advance the active
+//! conversation partition.
 //!
 //! # Write path (`append`)
 //!
-//! `append` reads the partition pointer (defaulting to `0`) and writes every
-//! message with `HSET` into the active partition, inside one atomic pipeline.
-//! A condensation increments the pointer with `INCR` first, so the message
-//! lands in the freshly opened partition. If the pointer does not exist yet,
-//! it is initialized to `0` in the same pipeline.
+//! `append` reads the partition pointer (defaulting to `1`) and writes every
+//! conversation message with `HSET` into the active partition, inside one
+//! atomic pipeline. A preamble is written only if partition `0` is empty. A
+//! condensation increments the pointer with `INCR` first, so the message
+//! lands in the freshly opened partition. Missing or legacy pointers below
+//! `1` are normalized to `1` in the same pipeline.
 //!
 //! `append` is expected to receive few messages per call, so messages are
 //! compressed one by one.
 //!
 //! # Read path (`history`)
 //!
-//! `history` resolves the active partition with `GET` and then reads the whole
-//! partition with a single `HGETALL`. Since `HGETALL` does not guarantee field
-//! order, decoded messages are sorted by their ULID id, whose lexicographic
-//! order matches creation order.
+//! `history` resolves the active conversation partition with `GET`, never
+//! reading partition `0`, and then reads it with a single `HGETALL`. Since
+//! `HGETALL` does not guarantee field order, decoded messages are sorted by
+//! their ULID id, whose lexicographic order matches creation order.
 //!
 //! # Compression and the blocking pool
 //!
@@ -73,6 +76,14 @@ use crate::session::{
   storage::{LogStorage, SessionMetaStore},
 };
 
+impl From<redis::RedisError> for LogError {
+  fn from(error: redis::RedisError) -> Self {
+    Self::Storage {
+      source: Box::new(error),
+    }
+  }
+}
+
 const SESSION_KEY_PREFIX: &str = "session";
 const META_KEY_PREFIX: &str = "meta";
 const PART_KEY_SUFFIX: &str = "part";
@@ -80,6 +91,12 @@ const CURRENT_PARTITION_KEY_SUFFIX: &str = "current_partition";
 
 /// Number of the first partition created for a session.
 const INITIAL_PARTITION: i64 = 0;
+const FIRST_CONVERSATION_PARTITION: i64 = INITIAL_PARTITION + 1;
+
+const INSERT_PREAMBLE_IF_EMPTY: &str = concat!(
+  "if redis.call('EXISTS', KEYS[1]) == 0 then ",
+  "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) end; return 1",
+);
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_COMPRESS_BLOCKING_THRESHOLD: usize = 8 * 1024;
@@ -257,13 +274,12 @@ where
       return Ok(ids);
     }
 
-    let mut encoded: Vec<(String, Vec<u8>, bool)> =
+    let mut encoded: Vec<(String, Vec<u8>, Etiqueta)> =
       Vec::with_capacity(messages.len());
     for message in &messages {
       let id = message.id.clone();
-      let is_condensation = message.etiqueta == Etiqueta::Condensation;
       let payload = self.encode_message_sized(message).await?;
-      encoded.push((id, payload, is_condensation));
+      encoded.push((id, payload, message.etiqueta));
     }
 
     let mut connection = self.connection.clone();
@@ -273,21 +289,61 @@ where
       .arg(&pointer_key)
       .query_async(&mut connection)
       .await?;
-    let needs_pointer_init = current.is_none();
-    let mut partition = current.unwrap_or(INITIAL_PARTITION);
+    let mut partition = current
+      .unwrap_or(FIRST_CONVERSATION_PARTITION)
+      .max(FIRST_CONVERSATION_PARTITION);
+    let needs_pointer_init =
+      current.is_none_or(|value| value < FIRST_CONVERSATION_PARTITION);
+    let has_preamble = encoded
+      .iter()
+      .any(|(_, _, etiqueta)| *etiqueta == Etiqueta::Preamble);
+    let initial_partition_key =
+      partition_key(agent_id, session_id, INITIAL_PARTITION);
+    let initial_partition_exists = if has_preamble {
+      redis::cmd("EXISTS")
+        .arg(&initial_partition_key)
+        .query_async(&mut connection)
+        .await?
+    } else {
+      false
+    };
 
     let mut pipeline = redis::pipe();
     pipeline.atomic();
+    let mut has_pipeline_commands = needs_pointer_init;
     if needs_pointer_init {
-      pipeline.set(&pointer_key, INITIAL_PARTITION);
+      pipeline.set(&pointer_key, partition);
     }
-    for (id, payload, is_condensation) in &encoded {
-      if *is_condensation {
-        pipeline.incr(&pointer_key, 1);
-        partition = partition.saturating_add(1);
+    for (id, payload, etiqueta) in &encoded {
+      match etiqueta {
+        Etiqueta::Preamble => {
+          if !initial_partition_exists {
+            pipeline
+              .cmd("EVAL")
+              .arg(INSERT_PREAMBLE_IF_EMPTY)
+              .arg(1)
+              .arg(&initial_partition_key)
+              .arg(id)
+              .arg(payload);
+            has_pipeline_commands = true;
+          }
+        }
+        Etiqueta::Condensation => {
+          pipeline.incr(&pointer_key, 1);
+          partition = partition.saturating_add(1);
+          let part_key = partition_key(agent_id, session_id, partition);
+          pipeline.hset(&part_key, id, payload);
+          has_pipeline_commands = true;
+        }
+        Etiqueta::None => {
+          let part_key = partition_key(agent_id, session_id, partition);
+          pipeline.hset(&part_key, id, payload);
+          has_pipeline_commands = true;
+        }
       }
-      let part_key = partition_key(agent_id, session_id, partition);
-      pipeline.hset(&part_key, id, payload);
+    }
+    if !has_pipeline_commands {
+      return Ok(ids);
     }
     pipeline.query_async::<()>(&mut connection).await?;
 
@@ -306,8 +362,10 @@ where
       .arg(&pointer_key)
       .query_async(&mut connection)
       .await?;
-    let part_key =
-      partition_key(agent_id, session_id, current.unwrap_or(INITIAL_PARTITION));
+    let partition = current
+      .unwrap_or(FIRST_CONVERSATION_PARTITION)
+      .max(FIRST_CONVERSATION_PARTITION);
+    let part_key = partition_key(agent_id, session_id, partition);
 
     let entries: HashMap<String, Vec<u8>> = redis::cmd("HGETALL")
       .arg(&part_key)
@@ -346,7 +404,7 @@ where
       .arg(&pointer_key)
       .query_async(&mut connection)
       .await?;
-    let last_partition = current.unwrap_or(INITIAL_PARTITION);
+    let last_partition = current.unwrap_or(FIRST_CONVERSATION_PARTITION);
 
     let requested_partition = i64::try_from(batch_index)
       .map_err(|_| LogError::InvalidBatchIndex { batch_index })?;
@@ -388,7 +446,7 @@ where
     let mut pipeline = redis::pipe();
     pipeline.atomic();
     pipeline.del(&pointer_key);
-    for partition in 0..=current.unwrap_or(INITIAL_PARTITION) {
+    for partition in 0..=current.unwrap_or(FIRST_CONVERSATION_PARTITION) {
       pipeline.del(partition_key(agent_id, session_id, partition));
     }
     pipeline.query_async::<()>(&mut connection).await?;
@@ -488,6 +546,7 @@ fn decompress_all(payloads: Vec<Vec<u8>>) -> Result<Vec<LogMessage>, LogError> {
 mod tests {
   use redis::Value;
   use redis_test::{MockCmd, MockRedisConnection};
+  use rstest::rstest;
 
   use super::*;
 
@@ -546,11 +605,12 @@ mod tests {
     let payload = compress(&json, DEFAULT_ZSTD_LEVEL).unwrap();
 
     let pointer_key = current_partition_key(agent_id, session_id);
-    let part_key = partition_key(agent_id, session_id, INITIAL_PARTITION);
+    let part_key =
+      partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
 
     let expected_pipeline = redis::pipe()
       .atomic()
-      .set(&pointer_key, INITIAL_PARTITION)
+      .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
       .hset(&part_key, &message.id, &payload)
       .clone();
 
@@ -571,6 +631,94 @@ mod tests {
       .expect("append should succeed");
 
     assert_eq!(ids, vec![message.id]);
+  }
+
+  #[rstest]
+  #[case::preamble_then_user(false, true)]
+  #[case::existing_partition_skips_preamble(true, false)]
+  #[tokio::test]
+  async fn append_keeps_a_single_preamble_in_the_initial_partition(
+    #[case] initial_partition_exists: bool,
+    #[case] append_user_message: bool,
+  ) {
+    let agent_id = "agent-1";
+    let session_id = "sess-1";
+    let preamble = LogMessage::with_id(
+      "01J000000000000000000010",
+      agent_id,
+      "Agent Smith",
+      session_id,
+      1_700_000_000_000,
+      Etiqueta::Preamble,
+      Message::system("system prompt"),
+    );
+    let user = sample_message("01J000000000000000000011", agent_id, session_id);
+    let mut messages = vec![preamble.clone()];
+    if append_user_message {
+      messages.push(user.clone());
+    }
+
+    let preamble_payload =
+      compress(&serde_json::to_vec(&preamble).unwrap(), DEFAULT_ZSTD_LEVEL)
+        .unwrap();
+    let user_payload =
+      compress(&serde_json::to_vec(&user).unwrap(), DEFAULT_ZSTD_LEVEL)
+        .unwrap();
+    let pointer_key = current_partition_key(agent_id, session_id);
+    let initial_key = partition_key(agent_id, session_id, INITIAL_PARTITION);
+    let conversation_key =
+      partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
+
+    let mut expected_pipeline = redis::pipe();
+    expected_pipeline.atomic();
+    let mut pipeline_values = Vec::new();
+    if !initial_partition_exists {
+      expected_pipeline
+        .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
+        .cmd("EVAL")
+        .arg(INSERT_PREAMBLE_IF_EMPTY)
+        .arg(1)
+        .arg(&initial_key)
+        .arg(&preamble.id)
+        .arg(&preamble_payload);
+      pipeline_values.extend([Value::Okay, Value::Int(1)]);
+    }
+    if append_user_message {
+      expected_pipeline.hset(&conversation_key, &user.id, &user_payload);
+      pipeline_values.push(Value::Int(1));
+    }
+
+    let mut commands = vec![MockCmd::new(
+      redis::cmd("GET").arg(&pointer_key),
+      if initial_partition_exists {
+        Ok(Value::Int(FIRST_CONVERSATION_PARTITION))
+      } else {
+        Ok(Value::Nil)
+      },
+    )];
+    commands.push(MockCmd::new(
+      redis::cmd("EXISTS").arg(&initial_key),
+      Ok(initial_partition_exists),
+    ));
+    if !initial_partition_exists || append_user_message {
+      commands.push(MockCmd::with_values(
+        expected_pipeline,
+        Ok(vec![Value::Array(pipeline_values)]),
+      ));
+    }
+
+    let mock =
+      MockRedisConnection::new(commands).assert_all_commands_consumed();
+    let storage = storage_with_mock(mock, DEFAULT_COMPRESS_BLOCKING_THRESHOLD);
+    let expected_ids: Vec<MessageId> =
+      messages.iter().map(|message| message.id.clone()).collect();
+
+    let ids = storage
+      .append(agent_id, session_id, messages)
+      .await
+      .expect("append should handle a preamble and an existing partition");
+
+    assert_eq!(ids, expected_ids);
   }
 
   #[tokio::test]
@@ -612,7 +760,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn append_condensation_without_pointer_opens_partition_one() {
+  async fn append_condensation_without_pointer_opens_partition_two() {
     let agent_id = "agent-1";
     let session_id = "sess-1";
     let message =
@@ -622,11 +770,11 @@ mod tests {
     let payload = compress(&json, DEFAULT_ZSTD_LEVEL).unwrap();
 
     let pointer_key = current_partition_key(agent_id, session_id);
-    let part_key = partition_key(agent_id, session_id, 1);
+    let part_key = partition_key(agent_id, session_id, 2);
 
     let expected_pipeline = redis::pipe()
       .atomic()
-      .set(&pointer_key, INITIAL_PARTITION)
+      .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
       .incr(&pointer_key, 1)
       .hset(&part_key, &message.id, &payload)
       .clone();
@@ -671,15 +819,16 @@ mod tests {
       compress(&serde_json::to_vec(&m3).unwrap(), DEFAULT_ZSTD_LEVEL).unwrap();
 
     let pointer_key = current_partition_key(agent_id, session_id);
-    let part0 = partition_key(agent_id, session_id, 0);
     let part1 = partition_key(agent_id, session_id, 1);
+    let part2 = partition_key(agent_id, session_id, 2);
 
     let expected_pipeline = redis::pipe()
       .atomic()
-      .hset(&part0, &m1.id, &payload1)
+      .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
+      .hset(&part1, &m1.id, &payload1)
       .incr(&pointer_key, 1)
-      .hset(&part1, &m2.id, &payload2)
-      .hset(&part1, &m3.id, &payload3)
+      .hset(&part2, &m2.id, &payload2)
+      .hset(&part2, &m3.id, &payload3)
       .clone();
 
     let mock = MockRedisConnection::new(vec![
@@ -687,6 +836,7 @@ mod tests {
       MockCmd::with_values(
         expected_pipeline,
         Ok(vec![Value::Array(vec![
+          Value::Int(1),
           Value::Int(1),
           Value::Int(1),
           Value::Int(1),
@@ -735,11 +885,12 @@ mod tests {
     let payload = compress(&json, DEFAULT_ZSTD_LEVEL).unwrap();
 
     let pointer_key = current_partition_key(agent_id, session_id);
-    let part_key = partition_key(agent_id, session_id, INITIAL_PARTITION);
+    let part_key =
+      partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
 
     let expected_pipeline = redis::pipe()
       .atomic()
-      .set(&pointer_key, INITIAL_PARTITION)
+      .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
       .hset(&part_key, &message.id, &payload)
       .clone();
 
@@ -764,7 +915,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn history_reads_active_partition_ordered_by_id() {
+  async fn history_reads_from_partition_one_not_the_initial_partition() {
     let agent_id = "agent-1";
     let session_id = "sess-1";
     let m1 = sample_message("01J000000000000000000001", agent_id, session_id);
@@ -781,7 +932,7 @@ mod tests {
     // Entries are returned out of order on purpose to prove `history`
     // restores chronological order from the ULID ids.
     let mock = MockRedisConnection::new(vec![
-      MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(1_i64)),
+      MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(0_i64)),
       MockCmd::new(
         redis::cmd("HGETALL").arg(&part_key),
         Ok(Value::Map(vec![
@@ -814,7 +965,8 @@ mod tests {
     let session_id = "sess-1";
 
     let pointer_key = current_partition_key(agent_id, session_id);
-    let part_key = partition_key(agent_id, session_id, INITIAL_PARTITION);
+    let part_key =
+      partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
 
     let mock = MockRedisConnection::new(vec![
       MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(Value::Nil)),
@@ -848,7 +1000,8 @@ mod tests {
       compress(&serde_json::to_vec(&m2).unwrap(), DEFAULT_ZSTD_LEVEL).unwrap();
 
     let pointer_key = current_partition_key(agent_id, session_id);
-    let part_key = partition_key(agent_id, session_id, INITIAL_PARTITION);
+    let part_key =
+      partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
 
     let mock = MockRedisConnection::new(vec![
       MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(Value::Nil)),
@@ -999,7 +1152,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn delete_session_without_pointer_deletes_initial_partition() {
+  async fn delete_session_without_pointer_deletes_initial_partitions() {
     let agent_id = "agent-1";
     let session_id = "sess-1";
 
@@ -1008,13 +1161,22 @@ mod tests {
       .atomic()
       .del(&pointer_key)
       .del(partition_key(agent_id, session_id, INITIAL_PARTITION))
+      .del(partition_key(
+        agent_id,
+        session_id,
+        FIRST_CONVERSATION_PARTITION,
+      ))
       .clone();
 
     let mock = MockRedisConnection::new(vec![
       MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(Value::Nil)),
       MockCmd::with_values(
         expected_pipeline,
-        Ok(vec![Value::Array(vec![Value::Int(1), Value::Int(1)])]),
+        Ok(vec![Value::Array(vec![
+          Value::Int(1),
+          Value::Int(1),
+          Value::Int(1),
+        ])]),
       ),
     ])
     .assert_all_commands_consumed();

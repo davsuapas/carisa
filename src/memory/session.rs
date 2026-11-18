@@ -30,7 +30,6 @@ pub mod error;
 pub mod migration;
 pub mod redis;
 pub mod storage;
-pub mod streaming;
 pub mod types;
 
 pub mod inmemory;
