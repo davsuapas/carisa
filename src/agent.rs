@@ -1,13 +1,12 @@
-//! Agent definitions and runtime configuration for constructing an agent
-//! platform.
+//! Agent definitions and agent platform configuration.
 //!
-//! Create agents first with [`crate::AgentBuilder`], then pass the completed
-//! agents to [`AgentPlatformBuilder`]. The platform builder combines
-//! provider, HTTP, model, default, agent, and log-storage settings, then
-//! [`AgentPlatformBuilder::build`] validates references and creates an
-//! [`AgentPlatform`]. Providers and models must be configured in code, a JSON
-//! file, or environment variables. Agents and log storage are supplied to
-//! the builder in Rust.
+//! Create agents with [`crate::AgentBuilder`], then hand them to
+//! [`AgentPlatformBuilder`], which combines providers, the shared
+//! [`Transport`], models, defaults, agents, and log storage.
+//! [`AgentPlatformBuilder::build`] validates every reference and every
+//! resolved model, then yields an [`AgentPlatform`]. Providers and models
+//! come from a JSON file or from Rust; the environment contributes the file
+//! path and credentials only.
 //!
 //! # Creating agents
 //!
@@ -42,12 +41,12 @@
 //! assert_eq!(agent.model().map(AgentModel::id), Some("gpt-4o"));
 //! ```
 //!
-//! [`crate::AgentModel`] selects a model by its platform-configured ID. If
-//! omitted, the runtime can use the platform's default model. It can also
-//! carry per-agent [`config::Generation`] settings and additional
-//! provider-specific parameters; these are optional overrides, not a
-//! separate model definition. When an agent is attached to a platform,
-//! platform validation rejects an explicit model ID that is not configured.
+//! [`crate::AgentModel`] selects a model by its platform-configured ID and
+//! optionally overrides part of that model's [`config::Generation`] and its
+//! additional parameters. Both overrides default to empty, so
+//! `AgentModel::new("gpt-4o")` inherits everything. Omitting the model
+//! entirely binds the agent to the platform default. When an agent is
+//! attached to a platform, validation rejects an ID that is not configured.
 //!
 //! Builder setters for `domain_skills` and `platform_skills` replace the
 //! entire corresponding list when called again; they do not append. Supply
@@ -72,7 +71,7 @@
 //!     .model("gpt-4o")
 //!     .build()?;
 //!
-//!   // Use from_env() instead to initialize from CARISA_ variables.
+//!   // With CARISA_CONFIG_PATH set, from_env_path() reads this file instead.
 //!   let platform = AgentPlatformBuilder::from_file("runtime.json")?
 //!     .agent(agent)
 //!     .log_storage(Arc::new(InMemoryLogStorage::new()))
@@ -85,43 +84,49 @@
 //!
 //! # Configuration sources
 //!
-//! [`AgentPlatformBuilder::from_file`] reads a JSON file and
-//! [`AgentPlatformBuilder::from_env`] reads variables beginning with
-//! `CARISA_`. Each is an independent initializer for a new builder; neither
-//! automatically loads or overlays the other. After initialization, use the
-//! builder methods to add or override values. There is no implicit priority
-//! between a file and the environment.
-//!
-//! File and environment input support the `providers`, `http`, `models`, and
-//! `defaults` sections. They do not create agents: a JSON `agents` property
-//! and `CARISA_AGENTS` are ignored. Construct agents with
-//! [`crate::AgentBuilder`] and attach them using the builder methods.
+//! The contract is a JSON file, read by
+//! [`AgentPlatformBuilder::from_file`], or named by `CARISA_CONFIG_PATH`
+//! and read by [`AgentPlatformBuilder::from_env_path`]. The environment adds
+//! nothing else: with no `CARISA_`-to-configuration mapping there is no
+//! implicit layering, and each load yields a fresh builder that later method
+//! calls add to or replace.
 //!
 //! Provider entries are keyed by their `name`, and model entries by their
-//! `id`. Adding an entry with an existing key replaces that entire provider
-//! or model; the fields inside the old and new values are not recursively
-//! merged. New keys are appended. The builder's `http` and `defaults` values
-//! are replaced as whole values when set again; `default_model` updates the
-//! default model field. Calls to `agent` and `agents` append agents.
+//! `id`; a key that disagrees with the entry is an error, not a label.
+//! Adding an entry with an existing key replaces that entire provider or
+//! model; the fields inside the old and new values are not recursively
+//! merged. New keys are appended. `transport` and `defaults` are replaced as
+//! whole values when set again; `default_model` updates the default model
+//! field. Calls to `agent` and `agents` append agents.
 //!
 //! For an all-Rust setup, start with `AgentPlatformBuilder::new(log_storage)`
 //! or `AgentPlatformBuilder::default()` and set values with `providers`,
-//! `http`, `models`, `default_model`, `agent`, and `log_storage`.
-//! `build` then checks that providers and models exist, every model points
-//! to a configured provider, default and agent model IDs exist, and HTTP
-//! settings are available either platform-wide or on each provider.
+//! `transport`, `models`, `default_model`, `agent`, and `log_storage`.
+//!
+//! # Precedence
+//!
+//! [`AgentPlatform::resolve`] applies the platform's precedence once:
+//!
+//! 1. the agent's model ID, or `defaults.model` when the agent selects none;
+//! 2. that model's provider, through the model's `provider` reference;
+//! 3. the model's [`config::Generation`] with the agent's overrides laid over
+//!    it field by field. `additional_params` merges by key with the agent
+//!    winning, and a field the agent leaves unset is inherited.
+//!
+//! `build` walks every agent through that path, so a broken reference or an
+//! option the model refuses fails at startup instead of on the first call.
 //!
 //! # JSON file format
 //!
-//! The root is an object. Provider and model collections are objects, and
-//! each entry contains a complete serialized value. The map key is a label;
-//! the provider's `name` and model's `id` fields determine identity. Values
-//! use the field names and `snake_case` enum spellings shown below. See
-//! [`config`] for the available fields and defaults.
+//! The root is an object that requires `schema_version: 1`. It may contain
+//! `providers`, `transport`, `models`, and `defaults`; any other section is
+//! an error. Provider and model collections are objects holding complete
+//! values. See [`config`] for the available fields and defaults.
 //!
 //! ```json
 //! {
-//!   "http": { "base_url": "https://api.openai.com/v1" },
+//!   "schema_version": 1,
+//!   "transport": { "timeout_ms": 60000 },
 //!   "providers": {
 //!     "openai": {
 //!       "name": "openai",
@@ -141,45 +146,44 @@
 //! }
 //! ```
 //!
-//! `api_key` is required by the provider value. A secret is represented as
-//! one of `{"literal":"..."}`, `{"env":"VARIABLE_NAME"}`, or
-//! `{"file":"/path/to/secret"}`. These variants describe the secret
-//! source; the platform builder does not expand or read the referenced
-//! environment variable or file. Avoid `literal` for real credentials in
+//! `kind` is a rig provider selection: a bare vendor when only one format is
+//! registered for it, `vendor/format` otherwise (`"minimax/anthropic"`).
+//! There is no `openai_compatible`: a gateway that reproduces the `OpenAI`
+//! API is `"openai"` plus a provider `base_url`. `api_key` is required only when
+//! the selection needs a credential. A secret is one of
+//! `{"literal":"..."}`, `{"env":"VARIABLE_NAME"}`, or
+//! `{"file":"/path/to/secret"}`; it is resolved when a client is built, not
+//! when the file is read. Avoid `literal` for real credentials in
 //! checked-in configuration.
 //!
-//! # Environment variables
+//! # Agents are Rust values
 //!
-//! Variable names use `CARISA_` followed by path components separated by
-//! double underscores (`__`). Each component is lowercased, so the following
-//! variables build the same shape as the JSON example:
+//! Agents are defined in Rust, so per-agent overrides are not yet an
+//! operator-editable part of the file: until [`crate::Agent`] carries an
+//! `id` and the format admits an `agents` section, changing an agent means
+//! rebuilding. From configuration, `agent.model == None` is the only way to
+//! say "use the default model".
 //!
-//! ```sh
-//! CARISA_HTTP__BASE_URL=https://api.openai.com/v1
-//! CARISA_PROVIDERS__OPENAI__NAME=openai
-//! CARISA_PROVIDERS__OPENAI__KIND=openai
-//! CARISA_PROVIDERS__OPENAI__API_KEY__ENV=OPENAI_API_KEY
-//! CARISA_PROVIDERS__OPENAI__RETRIES__MAX_RETRIES=4
-//! CARISA_MODELS__GPT-4O__ID=gpt-4o
-//! CARISA_MODELS__GPT-4O__PROVIDER=openai
-//! CARISA_MODELS__GPT-4O__GENERATION__TEMPERATURE=0.2
-//! CARISA_DEFAULTS__MODEL=gpt-4o
-//! ```
+//! # Where rig lives
 //!
-//! Each value that is valid JSON is parsed as JSON: use `true`, `2048`, or
-//! `0.2` for booleans and numbers. Other values remain strings. A complete
-//! object can also be provided as a JSON-valued environment variable, for
-//! example `CARISA_HTTP='{"base_url":"https://api.example"}'`.
+//! [`connect`] is the only module that imports `rig_core`. Provider identity
+//! is [`ProviderId`], taken from rig's registry; the transport, the request,
+//! and the catalog checks are built there. Upgrading or forking rig is a
+//! change confined to that module.
 
 pub mod config;
+pub mod connect;
 pub mod error;
 pub mod platform;
 pub mod provider;
+pub mod resolve;
 pub mod secret;
 pub mod types;
 
+pub use config::Transport;
 pub use error::PlatformError;
 pub use platform::{AgentPlatform, AgentPlatformBuilder};
-pub use provider::ProviderKind;
+pub use provider::ProviderId;
+pub use resolve::ResolvedModel;
 pub use secret::Secret;
 pub use types::{Agent, AgentBuilder, AgentModel};

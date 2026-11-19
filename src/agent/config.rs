@@ -1,26 +1,33 @@
-//! Typed values used by runtime configuration.
+//! Typed configuration values for an agent platform.
 //!
-//! These types are available under `runtime::config`; they are not
-//! re-exported from `runtime` or the crate root. Their serde representation
-//! uses the Rust field names in `snake_case`. A provider requires `name`,
-//! `kind`, and `api_key`; a model requires `id` and `provider`; HTTP settings
-//! require `base_url`. Other fields are optional or defaulted where noted on
-//! each type. Provider and model identity during builder merges comes from
-//! `name` and `id`, respectively, not from the JSON object's map key.
+//! These values describe *what* to call, never *how* to reach it: the
+//! transport, the credentials, and the request itself are built by the
+//! `connect` module, the only place that knows about `rig-core`. Field names
+//! are the JSON keys, in `snake_case`, so the serialized form is the contract
+//! an operator edits.
+//!
+//! - [`Provider`] names a vendor selection through [`ProviderId`]
+//!   (`"openai"`, `"minimax/anthropic"`) and may override the dialect's
+//!   endpoint, headers, retries, and TLS settings.
+//! - [`Transport`] holds the settings every provider shares: timeouts,
+//!   proxy, default headers, and an optional caller identity for corporate
+//!   gateways.
+//! - [`Model`] binds a model identifier to a provider and carries the base
+//!   [`Generation`] that agents inherit from.
 //!
 //! ```json
 //! {
-//!   "http": {
-//!     "base_url": "https://api.example",
-//!     "headers": { "x-client": "carisa" },
-//!     "options": { "timeout": 30 }
+//!   "schema_version": 1,
+//!   "transport": {
+//!     "timeout_ms": 60000,
+//!     "connect_timeout_ms": 5000,
+//!     "default_headers": { "x-client": "carisa" }
 //!   },
 //!   "providers": {
 //!     "openai": {
 //!       "name": "openai",
 //!       "kind": "openai",
-//!       "api_key": { "env": "OPENAI_API_KEY" },
-//!       "tls": { "insecure_skip_verify": false }
+//!       "api_key": { "env": "OPENAI_API_KEY" }
 //!     }
 //!   },
 //!   "models": {
@@ -31,6 +38,7 @@
 //!       "generation": {
 //!         "temperature": 0.2,
 //!         "max_tokens": 2048,
+//!         "top_p": 0.9,
 //!         "additional_params": { "reasoning_effort": "high" }
 //!       }
 //!     }
@@ -38,26 +46,39 @@
 //!   "defaults": { "model": "gpt-4o" }
 //! }
 //! ```
+//!
+//! [`ProviderId`]: crate::agent::ProviderId
 
 use std::collections::HashMap;
 
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
-use super::provider::ProviderKind;
+use super::provider::ProviderId;
 use super::secret::Secret;
 
-/// Additional generation parameters.
+/// Generation parameters shared by a model and its agents.
+///
+/// Every field is optional: a model sets the baseline, and an agent's
+/// [`AgentModel`](crate::agent::AgentModel) overrides only the fields it
+/// sets. Unset fields fall through to the provider's default.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Builder)]
 #[builder(pattern = "owned")]
 #[non_exhaustive]
 pub struct Generation {
   /// Sampling temperature.
-  #[builder(default, setter(into, strip_option))]
+  #[builder(default, setter(strip_option))]
   temperature: Option<f64>,
   /// Maximum number of tokens to generate.
-  #[builder(default, setter(into, strip_option))]
+  #[builder(default, setter(strip_option))]
   max_tokens: Option<u32>,
+  /// Nucleus sampling probability mass.
+  #[builder(default, setter(strip_option))]
+  top_p: Option<f64>,
+  /// Sampling seed, for providers that offer best-effort determinism.
+  #[builder(default, setter(strip_option))]
+  seed: Option<u64>,
   /// Additional model parameters keyed by name.
   #[builder(default)]
   #[serde(default)]
@@ -80,52 +101,143 @@ impl Generation {
     self.max_tokens
   }
 
+  /// Nucleus sampling probability mass.
+  pub const fn top_p(&self) -> Option<f64> {
+    self.top_p
+  }
+
+  /// Sampling seed.
+  pub const fn seed(&self) -> Option<u64> {
+    self.seed
+  }
+
   /// Additional model parameters keyed by name.
   pub const fn additional_params(&self) -> &HashMap<String, serde_json::Value> {
     &self.additional_params
   }
+
+  /// Overlays `over` on this value: its set scalars win, and its additional
+  /// parameters are merged by key.
+  pub(crate) fn overlay(&mut self, over: &Self) {
+    if over.temperature.is_some() {
+      self.temperature = over.temperature;
+    }
+    if over.max_tokens.is_some() {
+      self.max_tokens = over.max_tokens;
+    }
+    if over.top_p.is_some() {
+      self.top_p = over.top_p;
+    }
+    if over.seed.is_some() {
+      self.seed = over.seed;
+    }
+    self.overlay_params(&over.additional_params);
+  }
+
+  /// Merges `params` into the additional parameters, `params` winning.
+  pub(crate) fn overlay_params(
+    &mut self,
+    params: &HashMap<String, serde_json::Value>,
+  ) {
+    self.additional_params.extend(
+      params
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone())),
+    );
+  }
 }
 
-/// HTTP client options for a provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
+/// Identity a corporate gateway expects on every request.
+///
+/// It is valid only on a platform whose providers all speak the `OpenAI`
+/// format, because that is the only family whose configuration carries one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Builder)]
 #[builder(pattern = "owned")]
 #[non_exhaustive]
-pub struct Http {
-  /// Base URL used for HTTP requests.
-  base_url: String,
-  /// Custom request headers.
-  #[builder(default)]
-  #[serde(default)]
-  headers: HashMap<String, String>,
-  /// Additional options used by the provider.
-  #[builder(default)]
-  #[serde(default)]
-  options: HashMap<String, serde_json::Value>,
+pub struct CallerIdentity {
+  /// Value of the gateway's `originator` header.
+  originator: String,
+  /// Value of the `user-agent` header, defaulting to the crate name and
+  /// version.
+  #[builder(default, setter(into, strip_option))]
+  user_agent: Option<String>,
 }
 
-impl Http {
-  /// Creates an HTTP configuration with its required base URL.
-  pub fn new(base_url: impl Into<String>) -> Self {
+impl CallerIdentity {
+  /// Creates an identity with the required originator.
+  pub fn new(originator: impl Into<String>) -> Self {
     Self {
-      base_url: base_url.into(),
-      headers: HashMap::new(),
-      options: HashMap::new(),
+      originator: originator.into(),
+      user_agent: None,
     }
   }
 
-  /// Returns the base URL for the provider.
-  pub fn base_url(&self) -> &str {
-    &self.base_url
+  /// Returns the `originator` value.
+  pub fn originator(&self) -> &str {
+    &self.originator
   }
 
-  /// Returns the custom request headers for the provider.
-  pub const fn headers(&self) -> &HashMap<String, String> {
-    &self.headers
+  /// Returns the optional `user-agent` override.
+  pub const fn user_agent(&self) -> Option<&String> {
+    self.user_agent.as_ref()
+  }
+}
+
+/// HTTP settings shared by every provider.
+///
+/// Each provider gets its own client built from these settings, so a proxy
+/// or a timeout applies everywhere without repeating it per provider.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Builder)]
+#[builder(pattern = "owned")]
+#[serde(default)]
+#[non_exhaustive]
+pub struct Transport {
+  /// Total time allowed for one request, in milliseconds.
+  #[builder(default, setter(strip_option))]
+  timeout_ms: Option<u64>,
+  /// Time allowed to establish a connection, in milliseconds.
+  #[builder(default, setter(strip_option))]
+  connect_timeout_ms: Option<u64>,
+  /// Proxy URL every provider routes through.
+  #[builder(default, setter(strip_option))]
+  proxy: Option<Url>,
+  /// Headers added to every provider's requests.
+  #[builder(default)]
+  default_headers: HashMap<String, String>,
+  /// Caller identity the gateway requires.
+  #[builder(default, setter(strip_option))]
+  identity: Option<CallerIdentity>,
+}
+
+impl Transport {
+  /// Creates a transport with no settings.
+  pub fn new() -> Self {
+    Self::default()
   }
 
-  /// Returns the additional options for the provider.
-  pub const fn options(&self) -> &HashMap<String, serde_json::Value> {
-    &self.options
+  /// Returns the request timeout in milliseconds.
+  pub const fn timeout_ms(&self) -> Option<u64> {
+    self.timeout_ms
+  }
+
+  /// Returns the connection timeout in milliseconds.
+  pub const fn connect_timeout_ms(&self) -> Option<u64> {
+    self.connect_timeout_ms
+  }
+
+  /// Returns the proxy URL.
+  pub const fn proxy(&self) -> Option<&Url> {
+    self.proxy.as_ref()
+  }
+
+  /// Returns the headers added to every request.
+  pub const fn default_headers(&self) -> &HashMap<String, String> {
+    &self.default_headers
+  }
+
+  /// Returns the configured caller identity.
+  pub const fn identity(&self) -> Option<&CallerIdentity> {
+    self.identity.as_ref()
   }
 }
 
@@ -276,46 +388,58 @@ impl Model {
   }
 }
 
-/// A provider definition used by the runtime.
+/// A provider definition.
 ///
-/// Its serialized `kind` is a stable lowercase identifier such as `openai`
-/// or `openai_compatible`. `api_key` is required by this value's schema even
-/// for provider kinds that do not use authentication. Optional provider HTTP
-/// settings override the platform-wide HTTP settings for that provider.
+/// `kind` is a `rig-core` provider selection: a bare vendor (`"openai"`)
+/// when this build registers exactly one format for it, or `vendor/format`
+/// (`"minimax/anthropic"`) when it registers more than one. Unknown,
+/// ambiguous, and unregistered values are rejected with their alternatives,
+/// never silently replaced.
+///
+/// `api_key` is required only when the selection requires a credential, and
+/// is ignored otherwise. `base_url` overrides the dialect's endpoint: an
+/// OpenAI-compatible gateway is expressed as `"openai"` plus `base_url`.
+/// `headers` are added on top of [`Transport::default_headers`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[builder(pattern = "owned")]
 #[non_exhaustive]
 pub struct Provider {
   /// Stable identifier for the provider.
   name: String,
-  /// Provider family.
-  kind: ProviderKind,
-  /// Provider API key secret.
-  api_key: Secret,
-  /// HTTP options.
+  /// Provider selection.
+  kind: ProviderId,
+  /// Credential source, when the selection needs one.
   #[builder(default, setter(into, strip_option))]
-  http: Option<Http>,
+  api_key: Option<Secret>,
+  /// Endpoint override for this provider.
+  #[builder(default, setter(strip_option))]
+  base_url: Option<Url>,
+  /// Headers added to this provider's requests.
+  #[builder(default)]
+  #[serde(default)]
+  headers: HashMap<String, String>,
   /// Retry policy.
   #[builder(default)]
   #[serde(default)]
   retries: Retries,
   /// TLS settings.
-  #[builder(default, setter(into, strip_option))]
+  #[builder(default, setter(strip_option))]
   tls: Option<Tls>,
 }
 
 impl Provider {
-  /// Creates a provider with a name and kind.
+  /// Creates a provider with the required fields.
   pub fn new(
     name: impl Into<String>,
-    kind: ProviderKind,
-    api_key: Secret,
+    kind: ProviderId,
+    api_key: Option<Secret>,
   ) -> Self {
     Self {
       name: name.into(),
       kind,
       api_key,
-      http: None,
+      base_url: None,
+      headers: HashMap::new(),
       retries: Retries::default(),
       tls: None,
     }
@@ -326,19 +450,24 @@ impl Provider {
     &self.name
   }
 
-  /// Returns the provider kind.
-  pub const fn kind(&self) -> &ProviderKind {
+  /// Returns the provider selection.
+  pub const fn kind(&self) -> &ProviderId {
     &self.kind
   }
 
-  /// Returns the provider API key secret.
-  pub const fn api_key(&self) -> &Secret {
-    &self.api_key
+  /// Returns the credential source, when one is configured.
+  pub const fn api_key(&self) -> Option<&Secret> {
+    self.api_key.as_ref()
   }
 
-  /// Returns the optional HTTP configuration.
-  pub const fn http(&self) -> Option<&Http> {
-    self.http.as_ref()
+  /// Returns the endpoint override.
+  pub const fn base_url(&self) -> Option<&Url> {
+    self.base_url.as_ref()
+  }
+
+  /// Returns the headers added to this provider's requests.
+  pub const fn headers(&self) -> &HashMap<String, String> {
+    &self.headers
   }
 
   /// Returns the retry policy.
@@ -357,13 +486,6 @@ mod tests {
   use super::*;
 
   #[test]
-  fn http_requires_base_url_during_deserialization() {
-    let result = serde_json::from_str::<Http>(r#"{"headers":{}}"#);
-
-    assert!(result.is_err());
-  }
-
-  #[test]
   fn retries_default_to_three_attempts_and_half_second_backoff() {
     assert_eq!(
       Retries::default(),
@@ -380,15 +502,17 @@ mod tests {
   }
 
   #[test]
-  fn provider_http_and_tls_are_optional() {
+  fn provider_network_settings_are_optional() {
     let provider = Provider::new(
       "local",
-      ProviderKind::Ollama,
-      Secret::Literal("test-key".into()),
+      ProviderId::resolve("ollama/openai").expect("the pair is registered"),
+      None,
     );
 
-    assert!(provider.http.is_none());
-    assert!(provider.tls.is_none());
+    assert!(provider.api_key().is_none());
+    assert!(provider.base_url().is_none());
+    assert!(provider.headers().is_empty());
+    assert!(provider.tls().is_none());
   }
 
   #[test]
@@ -398,20 +522,78 @@ mod tests {
       "kind": "openai",
       "api_key": { "literal": "test-key" }
     }))
-    .expect("provider has required credentials");
+    .expect("provider has the required fields");
 
     assert_eq!(provider.retries, Retries::default());
-    assert!(provider.http.is_none());
+    assert!(provider.base_url.is_none());
+    assert!(provider.headers.is_empty());
     assert!(provider.tls.is_none());
   }
 
   #[test]
-  fn provider_requires_api_key_during_deserialization() {
+  fn provider_api_key_is_optional_during_deserialization() {
+    let provider: Provider = serde_json::from_value(serde_json::json!({
+      "name": "local",
+      "kind": "ollama/openai"
+    }))
+    .expect("a local provider needs no credential");
+
+    assert!(provider.api_key().is_none());
+  }
+
+  #[test]
+  fn invalid_base_url_is_rejected_during_deserialization() {
     let result = serde_json::from_value::<Provider>(serde_json::json!({
-      "name": "openai",
-      "kind": "openai"
+      "name": "gateway",
+      "kind": "openai",
+      "base_url": "not a url"
     }));
 
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn ambiguous_kind_is_rejected_with_qualified_alternatives() {
+    let error = serde_json::from_value::<Provider>(serde_json::json!({
+      "name": "gateway",
+      "kind": "minimax"
+    }))
+    .expect_err("minimax registers more than one format");
+
+    assert!(error.to_string().contains("minimax/openai"));
+    assert!(error.to_string().contains("minimax/anthropic"));
+  }
+
+  #[test]
+  fn generation_overlay_keeps_the_base_and_lets_the_override_win() {
+    let mut base = GenerationBuilder::default()
+      .temperature(0.2)
+      .max_tokens(2048_u32)
+      .additional_params(HashMap::from([(
+        "reasoning_effort".to_owned(),
+        serde_json::json!("low"),
+      )]))
+      .build()
+      .expect("no required fields");
+    let over = GenerationBuilder::default()
+      .temperature(0.9)
+      .top_p(0.5)
+      .additional_params(HashMap::from([(
+        "reasoning_effort".to_owned(),
+        serde_json::json!("high"),
+      )]))
+      .build()
+      .expect("no required fields");
+
+    base.overlay(&over);
+
+    assert_eq!(base.temperature(), Some(0.9));
+    assert_eq!(base.max_tokens(), Some(2048));
+    assert_eq!(base.top_p(), Some(0.5));
+    assert_eq!(base.seed(), None);
+    assert_eq!(
+      base.additional_params().get("reasoning_effort"),
+      Some(&serde_json::json!("high"))
+    );
   }
 }

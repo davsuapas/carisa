@@ -7,21 +7,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DomainSkill, PlatformSkill, agent::config::Generation};
 
-/// Model configuration selected for an agent.
+/// Model selection and per-agent generation overrides.
+///
+/// The identifier names a model the platform configures. The overrides are
+/// laid over that model's [`Generation`] field by field: a field left unset
+/// is inherited, and `additional_params` is merged by key with the agent
+/// winning. Both default to empty, so `{"id": "gpt-4o"}` inherits
+/// everything.
 #[derive(Builder, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[builder(pattern = "owned")]
 #[non_exhaustive]
 pub struct AgentModel {
   /// Model identifier.
   id: String,
-  /// Generation options specific to this model selection.
+  /// Generation options this selection overrides.
   #[serde(default)]
-  #[builder(default, setter(into, strip_option))]
-  generation: Option<Generation>,
-  /// Additional parameters specific to this model selection.
+  #[builder(default)]
+  generation: Generation,
+  /// Additional parameters this selection overrides.
   #[serde(default)]
-  #[builder(default, setter(into, strip_option))]
-  additional_params: Option<HashMap<String, serde_json::Value>>,
+  #[builder(default)]
+  additional_params: HashMap<String, serde_json::Value>,
 }
 
 impl AgentModel {
@@ -29,8 +35,8 @@ impl AgentModel {
   pub fn new(id: impl Into<String>) -> Self {
     Self {
       id: id.into(),
-      generation: None,
-      additional_params: None,
+      generation: Generation::default(),
+      additional_params: HashMap::new(),
     }
   }
 
@@ -39,16 +45,14 @@ impl AgentModel {
     &self.id
   }
 
-  /// Returns the optional generation configuration.
-  pub const fn generation(&self) -> Option<&Generation> {
-    self.generation.as_ref()
+  /// Returns the generation overrides.
+  pub const fn generation(&self) -> &Generation {
+    &self.generation
   }
 
-  /// Returns the additional parameters.
-  pub const fn additional_params(
-    &self,
-  ) -> Option<&HashMap<String, serde_json::Value>> {
-    self.additional_params.as_ref()
+  /// Returns the additional parameter overrides.
+  pub const fn additional_params(&self) -> &HashMap<String, serde_json::Value> {
+    &self.additional_params
   }
 }
 
@@ -192,9 +196,13 @@ mod tests {
   fn model_accepts_identifier_and_optional_overrides() {
     let mut additional_params = HashMap::new();
     additional_params.insert("reasoning_effort".to_owned(), "high".into());
+    let generation = crate::agent::config::GenerationBuilder::default()
+      .temperature(0.4)
+      .build()
+      .expect("no required fields");
     let model = AgentModelBuilder::default()
       .id("model-id".to_owned())
-      .generation(Generation::default())
+      .generation(generation.clone())
       .additional_params(additional_params.clone())
       .build()
       .expect("model identifier provided");
@@ -203,23 +211,22 @@ mod tests {
       .model(model)
       .build()
       .expect("instructions provided");
+    let selected = agent.model().expect("the agent selects a model");
 
-    assert_eq!(agent.model.as_ref().unwrap().id, "model-id");
-    assert_eq!(
-      agent.model.unwrap().additional_params,
-      Some(additional_params)
-    );
+    assert_eq!(selected.id(), "model-id");
+    assert_eq!(selected.generation(), &generation);
+    assert_eq!(selected.additional_params(), &additional_params);
   }
 
   #[test]
-  fn model_overrides_are_optional_when_building_and_deserializing() {
+  fn model_overrides_default_to_empty_when_omitted() {
     let built_model = AgentModelBuilder::default()
       .id("model-id".to_owned())
       .build()
       .expect("model identifier is sufficient");
 
-    assert!(built_model.generation.is_none());
-    assert!(built_model.additional_params.is_none());
+    assert_eq!(built_model.generation, Generation::default());
+    assert!(built_model.additional_params.is_empty());
 
     let model: AgentModel = serde_json::from_value(serde_json::json!({
       "id": "model-id"
@@ -227,7 +234,25 @@ mod tests {
     .expect("model identifier is sufficient");
 
     assert_eq!(model.id, "model-id");
-    assert!(model.generation.is_none());
-    assert!(model.additional_params.is_none());
+    assert_eq!(model.generation, Generation::default());
+    assert!(model.additional_params.is_empty());
+  }
+
+  #[test]
+  fn model_inherits_every_field_it_leaves_unset() {
+    let model: AgentModel = serde_json::from_value(serde_json::json!({
+      "id": "model-id",
+      "generation": { "temperature": 0.1 },
+      "additional_params": { "reasoning_effort": "max" }
+    }))
+    .expect("the overrides are valid");
+
+    assert_eq!(model.generation().temperature(), Some(0.1));
+    assert_eq!(model.generation().max_tokens(), None);
+    assert_eq!(model.generation().top_p(), None);
+    assert_eq!(
+      model.additional_params().get("reasoning_effort"),
+      Some(&serde_json::json!("max"))
+    );
   }
 }

@@ -1,10 +1,11 @@
-//! Builder and validated runtime platform.
+//! Builder and validated agent platform.
 //!
-//! The builder accepts provider, HTTP, model, and default configuration from
-//! JSON or `CARISA_` environment variables. Both loaders start with an empty
-//! builder and return the same builder type; they do not load one another.
-//! Agents and log storage are configured in Rust. See the parent
-//! [`runtime`](super) module for full JSON and environment examples.
+//! The builder gathers providers, the shared [`Transport`], models, defaults,
+//! agents, and log storage, then validates them into an
+//! [`AgentPlatform`]. Configuration may come from a
+//! JSON file; agents and log storage are always supplied in Rust. See the
+//! parent [`agent`](super) module for the file format and the resolution
+//! rules.
 
 use std::{fs, path::Path, sync::Arc};
 
@@ -13,9 +14,23 @@ use derive_builder::Builder;
 use crate::memory::session::LogStorage;
 
 use super::{
-  config::{Defaults, Http, Model, Provider},
+  config::{Defaults, Generation, Model, Provider, Transport},
+  connect,
   error::PlatformError,
+  resolve::ResolvedModel,
 };
+
+/// The only schema version this build reads.
+const SCHEMA_VERSION: u64 = 1;
+
+/// Largest accepted retry count.
+const MAX_RETRIES: u32 = 10;
+
+/// Inclusive bounds for a sampling temperature.
+const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Inclusive bounds for nucleus sampling.
+const TOP_P_RANGE: std::ops::RangeInclusive<f64> = 0.0..=1.0;
 
 /// Configuration to run agents at runtime.
 #[derive(Builder, Clone)]
@@ -28,9 +43,9 @@ pub struct AgentPlatform {
   /// Configured providers.
   #[builder(default, setter(name = "provider_values"))]
   providers: Vec<Provider>,
-  /// Optional platform-wide HTTP settings.
+  /// HTTP settings shared by every provider.
   #[builder(default, setter(strip_option))]
-  http: Option<Http>,
+  transport: Option<Transport>,
   /// Configured models.
   #[builder(default, setter(name = "model_values"))]
   models: Vec<Model>,
@@ -49,7 +64,7 @@ impl std::fmt::Debug for AgentPlatform {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("AgentPlatform")
       .field("providers", &self.providers)
-      .field("http", &self.http)
+      .field("transport", &self.transport)
       .field("models", &self.models)
       .field("defaults", &self.defaults)
       .field("agents", &self.agents)
@@ -62,7 +77,7 @@ impl std::fmt::Debug for AgentPlatformBuilder {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("AgentPlatformBuilder")
       .field("providers", &self.providers)
-      .field("http", &self.http)
+      .field("transport", &self.transport)
       .field("models", &self.models)
       .field("defaults", &self.defaults)
       .field("agents", &self.agents)
@@ -107,21 +122,24 @@ impl AgentPlatformBuilder {
     self
   }
 
-  /// Loads provider, HTTP, model, and default settings from a JSON file.
+  /// Loads provider, transport, model, and default settings from a JSON file.
   ///
-  /// The root JSON object may contain `providers`, `http`, `models`, and
-  /// `defaults`. Provider and model collections must be objects; their
-  /// entries are deserialized as complete values. A JSON `agents` property
-  /// is ignored. This creates a fresh builder; use its methods to add agents
-  /// or override loaded values.
+  /// The root object requires `schema_version: 1` and may contain
+  /// `providers`, `transport`, `models`, and `defaults`. Unknown sections
+  /// are rejected rather than ignored, so a typo cannot silently produce a
+  /// default. Provider and model collections are objects whose keys must
+  /// match each entry's `name` and `id`. This creates a fresh builder; use
+  /// its methods to add agents or override loaded values.
   ///
-  /// Providers are keyed for replacement by their `name`, and models by
-  /// their `id`. Replacing an existing key replaces the complete value, not
-  /// just the fields present in a later source.
+  /// Entries are keyed for replacement by that same `name` or `id`.
+  /// Replacing an existing key replaces the complete value, not just the
+  /// fields present in a later source.
   ///
   /// # Errors
   ///
-  /// Returns an error when the file cannot be opened or parsed.
+  /// Returns an error when the file cannot be opened or parsed, when a
+  /// section or map key is unknown, or when `schema_version` is missing or
+  /// unsupported.
   pub fn from_file(path: impl AsRef<Path>) -> Result<Self, PlatformError> {
     let path = path.as_ref();
     let content =
@@ -140,42 +158,23 @@ impl AgentPlatformBuilder {
     Ok(builder)
   }
 
-  /// Loads provider, HTTP, model, and default settings from `CARISA_`
-  /// environment variables.
+  /// Loads configuration from the file named by `CARISA_CONFIG_PATH`.
   ///
-  /// Double underscores (`__`) separate nested path components, and each
-  /// component is converted to lowercase. For example,
-  /// `CARISA_PROVIDERS__OPENAI__API_KEY__ENV=OPENAI_API_KEY` sets the
-  /// provider's secret to the `Env` variant. Values that are valid JSON are
-  /// parsed as JSON values, so numbers, booleans, arrays, and objects retain
-  /// their types; other values remain strings. `CARISA_AGENTS` is ignored:
-  /// agents are supplied through the builder, not the environment.
-  ///
-  /// This creates a fresh builder rather than layering environment values on
-  /// a file-loaded builder. Use the builder methods to add or replace values
-  /// after loading. Existing providers are replaced by `name` and models by
-  /// `id`; each replacement is complete, not a recursive field merge.
+  /// The environment carries where the configuration lives and, through
+  /// [`Secret::Env`](crate::agent::Secret::Env), where credentials live;
+  /// everything else is in the file.
   ///
   /// # Errors
   ///
-  /// Returns an error if a nested value cannot be merged into the
-  /// configuration tree.
-  pub fn from_env() -> Result<Self, PlatformError> {
-    let mut root = serde_json::Value::Object(serde_json::Map::new());
-
-    for (key, value) in std::env::vars() {
-      if let Some(stripped) = key.strip_prefix("CARISA_") {
-        let path = stripped
-          .split("__")
-          .map(str::to_ascii_lowercase)
-          .collect::<Vec<_>>();
-        insert_nested_value(&mut root, &path, parse_env_value(value));
-      }
-    }
-
-    let mut builder = Self::default();
-    builder.merge_json_value(root)?;
-    Ok(builder)
+  /// [`PlatformError::MissingEnv`] when `CARISA_CONFIG_PATH` is not set, and
+  /// any error [`Self::from_file`] reports.
+  pub fn from_env_path() -> Result<Self, PlatformError> {
+    let variable = "CARISA_CONFIG_PATH";
+    let path =
+      std::env::var(variable).map_err(|_| PlatformError::MissingEnv {
+        variable: variable.to_owned(),
+      })?;
+    Self::from_file(path)
   }
 
   /// Sets the default model identifier.
@@ -221,64 +220,123 @@ impl AgentPlatformBuilder {
     &mut self,
     value: serde_json::Value,
   ) -> Result<(), PlatformError> {
-    if let serde_json::Value::Object(map) = value {
-      for (key, val) in map {
-        match key.as_str() {
-          "providers" => {
-            if let serde_json::Value::Object(entries) = val {
-              for (name, provider_value) in entries {
-                let provider = serde_json::from_value::<Provider>(
-                  provider_value,
-                )
-                .map_err(|source| PlatformError::Json {
-                  path: format!("providers.{name}"),
-                  source,
-                })?;
-                upsert_by(
-                  self.providers.get_or_insert_with(Vec::new),
-                  provider,
-                  |item| item.name(),
-                );
-              }
-            }
-          }
-          "http" => {
-            self.http =
-              Some(Some(serde_json::from_value::<Http>(val).map_err(
-                |source| PlatformError::Json {
-                  path: "http".to_owned(),
-                  source,
-                },
-              )?));
-          }
-          "models" => {
-            if let serde_json::Value::Object(entries) = val {
-              for (name, model_value) in entries {
-                let model = serde_json::from_value::<Model>(model_value)
-                  .map_err(|source| PlatformError::Json {
-                    path: format!("models.{name}"),
-                    source,
-                  })?;
-                upsert_by(
-                  self.models.get_or_insert_with(Vec::new),
-                  model,
-                  |item| item.id(),
-                );
-              }
-            }
-          }
-          "defaults" => {
-            self.defaults =
-              Some(serde_json::from_value::<Defaults>(val).map_err(
-                |source| PlatformError::Json {
-                  path: "defaults".to_owned(),
-                  source,
-                },
-              )?);
-          }
-          _ => {}
+    let serde_json::Value::Object(mut sections) = value else {
+      return Err(PlatformError::invalid(
+        "$",
+        "the configuration root must be an object",
+      ));
+    };
+
+    let version = sections.remove("schema_version").ok_or_else(|| {
+      PlatformError::invalid("schema_version", "is required and must be 1")
+    })?;
+    let version = version.as_u64().ok_or_else(|| {
+      PlatformError::invalid("schema_version", "must be a positive integer")
+    })?;
+    if version != SCHEMA_VERSION {
+      return Err(PlatformError::SchemaVersion { version });
+    }
+
+    for (section, value) in sections {
+      match section.as_str() {
+        "providers" => self.merge_providers(value)?,
+        "transport" => {
+          self.transport =
+            Some(Some(serde_json::from_value::<Transport>(value).map_err(
+              |source| PlatformError::Json {
+                path: "transport".to_owned(),
+                source,
+              },
+            )?));
+        }
+        "models" => self.merge_models(value)?,
+        "defaults" => {
+          self.defaults =
+            Some(serde_json::from_value::<Defaults>(value).map_err(
+              |source| PlatformError::Json {
+                path: "defaults".to_owned(),
+                source,
+              },
+            )?);
+        }
+        unknown => {
+          return Err(PlatformError::invalid(
+            unknown,
+            "unknown configuration section",
+          ));
         }
       }
+    }
+
+    Ok(())
+  }
+
+  /// Merges the `providers` section, rejecting keys that do not match the
+  /// provider's `name` and kinds this build cannot configure.
+  fn merge_providers(
+    &mut self,
+    value: serde_json::Value,
+  ) -> Result<(), PlatformError> {
+    let serde_json::Value::Object(entries) = value else {
+      return Err(PlatformError::invalid("providers", "must be an object"));
+    };
+
+    for (key, entry) in entries {
+      let path = format!("providers.{key}");
+      if let Some(kind) = entry.get("kind").and_then(serde_json::Value::as_str)
+      {
+        connect::resolve_provider_kind(&format!("{path}.kind"), kind)?;
+      }
+      let provider =
+        serde_json::from_value::<Provider>(entry).map_err(|source| {
+          PlatformError::Json {
+            path: path.clone(),
+            source,
+          }
+        })?;
+      if provider.name() != key {
+        return Err(PlatformError::invalid(
+          path,
+          "map key must match the provider's `name`",
+        ));
+      }
+      upsert_by(
+        self.providers.get_or_insert_with(Vec::new),
+        provider,
+        |item| item.name(),
+      );
+    }
+
+    Ok(())
+  }
+
+  /// Merges the `models` section, rejecting keys that do not match the
+  /// model's `id`.
+  fn merge_models(
+    &mut self,
+    value: serde_json::Value,
+  ) -> Result<(), PlatformError> {
+    let serde_json::Value::Object(entries) = value else {
+      return Err(PlatformError::invalid("models", "must be an object"));
+    };
+
+    for (key, entry) in entries {
+      let path = format!("models.{key}");
+      let model = serde_json::from_value::<Model>(entry).map_err(|source| {
+        PlatformError::Json {
+          path: path.clone(),
+          source,
+        }
+      })?;
+      if model.id() != key {
+        return Err(PlatformError::invalid(
+          path,
+          "map key must match the model's `id`",
+        ));
+      }
+      upsert_by(self.models.get_or_insert_with(Vec::new), model, |item| {
+        item.id()
+      });
     }
 
     Ok(())
@@ -289,7 +347,7 @@ impl AgentPlatform {
   /// Creates a platform from resolved configuration values.
   pub fn new(
     providers: Vec<Provider>,
-    http: Option<Http>,
+    transport: Option<Transport>,
     models: Vec<Model>,
     defaults: Defaults,
     agents: Vec<crate::agent::Agent>,
@@ -297,7 +355,7 @@ impl AgentPlatform {
   ) -> Self {
     Self {
       providers,
-      http,
+      transport,
       models,
       defaults,
       agents,
@@ -310,9 +368,9 @@ impl AgentPlatform {
     &self.providers
   }
 
-  /// Returns the optional platform-wide HTTP settings.
-  pub const fn http(&self) -> Option<&Http> {
-    self.http.as_ref()
+  /// Returns the HTTP settings shared by every provider.
+  pub const fn transport(&self) -> Option<&Transport> {
+    self.transport.as_ref()
   }
 
   /// Returns the configured models.
@@ -330,12 +388,19 @@ impl AgentPlatform {
     &self.agents
   }
 
-  /// Validates internal references for the platform.
+  /// Validates the platform without building a client.
+  ///
+  /// Providers must exist and be configurable by this build; each one must
+  /// carry a credential exactly when its selection requires one. Models must
+  /// point at a configured provider, and every agent must resolve through
+  /// [`Self::resolve`], so precedence is checked at startup rather than on
+  /// the first call. Resolved models the catalog knows are checked against
+  /// it; models it does not know are accepted as local or gateway-specific.
   ///
   /// # Errors
   ///
-  /// Returns an error when providers or models are missing, HTTP settings are
-  /// unavailable, or a reference points to a missing target.
+  /// [`PlatformError::Invalid`] at the offending path, or
+  /// [`PlatformError::SchemaVersion`] for an unsupported schema.
   pub fn validate(&self) -> Result<(), PlatformError> {
     if self.providers.is_empty() {
       return Err(PlatformError::invalid(
@@ -351,33 +416,47 @@ impl AgentPlatform {
       ));
     }
 
-    if let Some(http) = &self.http {
-      validate_http("http", http)?;
+    if let Some(transport) = &self.transport {
+      validate_transport(transport)?;
+    }
+
+    if self
+      .transport
+      .as_ref()
+      .is_some_and(|transport| transport.identity().is_some())
+      && !self
+        .providers
+        .iter()
+        .all(|provider| connect::speaks_openai(provider.kind()))
+    {
+      return Err(PlatformError::invalid(
+        "transport.identity",
+        "caller identity requires every provider to speak the OpenAI format",
+      ));
     }
 
     for provider in &self.providers {
-      if let Some(http) = provider.http() {
-        validate_http(&format!("providers.{}.http", provider.name()), http)?;
-      }
-      if self.http.is_none() && provider.http().is_none() {
-        return Err(PlatformError::invalid(
-          format!("providers.{}.http", provider.name()),
-          "provider HTTP settings are required when platform HTTP is absent",
-        ));
-      }
+      validate_provider(provider)?;
     }
 
     for model in &self.models {
-      if !self
+      let Some(provider) = self
         .providers
         .iter()
-        .any(|provider| provider.name() == model.provider())
-      {
+        .find(|provider| provider.name() == model.provider())
+      else {
         return Err(PlatformError::invalid(
           format!("models.{}.provider", model.id()),
           "referenced provider does not exist",
         ));
-      }
+      };
+      validate_generation(
+        &format!("models.{}", model.id()),
+        model.generation(),
+      )?;
+      let resolved =
+        ResolvedModel::new(provider, model, model.generation().clone());
+      connect::validate_against_catalog(&resolved)?;
     }
 
     if let Some(model_id) = self.defaults.model()
@@ -390,27 +469,103 @@ impl AgentPlatform {
     }
 
     for (idx, agent) in self.agents.iter().enumerate() {
-      if let Some(m) = agent.model()
-        && !self.models.iter().any(|model| model.id() == m.id())
-      {
-        return Err(PlatformError::invalid(
-          format!("agents[{idx}].model.id"),
-          "referenced model does not exist",
-        ));
-      }
+      let resolved =
+        self.resolve_at(agent, &format!("agents[{idx}].model.id"))?;
+      validate_generation(
+        &format!("agents[{idx}].model.generation"),
+        resolved.generation(),
+      )?;
+      connect::validate_against_catalog(&resolved)?;
     }
 
     Ok(())
   }
 }
 
-fn validate_http(path: &str, http: &Http) -> Result<(), PlatformError> {
-  if http.base_url().trim().is_empty() {
+/// Validates the shared transport settings.
+fn validate_transport(transport: &Transport) -> Result<(), PlatformError> {
+  validate_timeout("transport.timeout_ms", transport.timeout_ms())?;
+  validate_timeout(
+    "transport.connect_timeout_ms",
+    transport.connect_timeout_ms(),
+  )?;
+  connect::validate_headers(
+    "transport.default_headers",
+    transport.default_headers(),
+  )?;
+  Ok(())
+}
+
+/// Validates one provider's identity, credential, retries, and headers.
+fn validate_provider(provider: &Provider) -> Result<(), PlatformError> {
+  let path = format!("providers.{}", provider.name());
+
+  if !provider.kind().is_registered() {
     return Err(PlatformError::invalid(
-      format!("{path}.base_url"),
-      "base URL must not be empty",
+      format!("{path}.kind"),
+      format!("`{}` is not configurable by this build", provider.kind()),
     ));
   }
+
+  if provider.kind().requires_credential() && provider.api_key().is_none() {
+    return Err(PlatformError::invalid(
+      format!("{path}.api_key"),
+      format!("`{}` requires a credential", provider.kind()),
+    ));
+  }
+
+  if provider.retries().max_retries() > MAX_RETRIES {
+    return Err(PlatformError::invalid(
+      format!("{path}.retries.max_retries"),
+      format!("must be at most {MAX_RETRIES}"),
+    ));
+  }
+
+  if provider.retries().backoff_ms() == 0 {
+    return Err(PlatformError::invalid(
+      format!("{path}.retries.backoff_ms"),
+      "must be greater than zero",
+    ));
+  }
+
+  connect::validate_headers(&format!("{path}.headers"), provider.headers())?;
+  Ok(())
+}
+
+/// Validates a timeout that must be positive when set.
+fn validate_timeout(
+  path: &str,
+  value: Option<u64>,
+) -> Result<(), PlatformError> {
+  match value {
+    Some(0) => Err(PlatformError::invalid(path, "must be greater than zero")),
+    _ => Ok(()),
+  }
+}
+
+/// Validates sampling bounds for a generation block.
+fn validate_generation(
+  path: &str,
+  generation: &Generation,
+) -> Result<(), PlatformError> {
+  if let Some(temperature) = generation.temperature()
+    && !TEMPERATURE_RANGE.contains(&temperature)
+  {
+    return Err(PlatformError::invalid(
+      format!("{path}.temperature"),
+      "must be within 0.0..=2.0",
+    ));
+  }
+
+  if let Some(top_p) = generation.top_p()
+    && !TOP_P_RANGE.contains(&top_p)
+  {
+    return Err(PlatformError::invalid(
+      format!("{path}.top_p"),
+      "must be within 0.0..=1.0",
+    ));
+  }
+
   Ok(())
 }
 
@@ -424,69 +579,29 @@ fn upsert_by<T>(items: &mut Vec<T>, item: T, key: impl Fn(&T) -> &str) {
   }
 }
 
-fn insert_nested_value(
-  target: &mut serde_json::Value,
-  path: &[String],
-  value: serde_json::Value,
-) {
-  let mut current = target;
-  for part in path.iter().take(path.len().saturating_sub(1)) {
-    if !current.is_object() {
-      *current = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let Some(obj) = current.as_object_mut() else {
-      return;
-    };
-    current = obj
-      .entry(part.clone())
-      .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-  }
-
-  if let Some(last) = path.last() {
-    if !current.is_object() {
-      *current = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let Some(object) = current.as_object_mut() else {
-      return;
-    };
-    object.insert(last.clone(), value);
-  }
-}
-
-fn parse_env_value(value: String) -> serde_json::Value {
-  serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value))
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::{
-    agent::config::{
-      Generation, ModelBuilder, ProviderBuilder, Retries, TlsBuilder,
+    agent::{
+      ProviderId, Secret,
+      config::{
+        CallerIdentity, GenerationBuilder, ModelBuilder, ProviderBuilder,
+        Retries, RetriesBuilder, TlsBuilder, TransportBuilder,
+      },
     },
-    agent::{ProviderKind, Secret},
     memory::session::inmemory::InMemoryLogStorage,
   };
   use rstest::rstest;
 
   fn provider(name: &str) -> Provider {
-    provider_with_http(name, Http::new(format!("https://{name}.example")))
+    provider_of(name, "openai")
   }
 
-  fn provider_with_http(name: &str, http: Http) -> Provider {
+  fn provider_of(name: &str, kind: &str) -> Provider {
     ProviderBuilder::default()
       .name(name.to_owned())
-      .kind(ProviderKind::OpenAI)
-      .api_key(Secret::Literal("test-api-key".to_owned()))
-      .http(http)
-      .build()
-      .expect("provider builder has all required fields")
-  }
-
-  fn provider_without_http(name: &str) -> Provider {
-    ProviderBuilder::default()
-      .name(name.to_owned())
-      .kind(ProviderKind::OpenAI)
+      .kind(ProviderId::resolve(kind).expect("kind is registered"))
       .api_key(Secret::Literal("test-api-key".to_owned()))
       .build()
       .expect("provider builder has all required fields")
@@ -580,12 +695,16 @@ mod tests {
   #[rstest]
   #[case("Providers are empty.Invalid", "providers")]
   #[case("Models are empty.Invalid", "models")]
-  #[case("Platform HTTP URL is blank.Invalid", "http.base_url")]
+  #[case("Transport timeout is zero.Invalid", "transport.timeout_ms")]
+  #[case("Temperature is out of range.Invalid", "models.gpt-4o.temperature")]
+  #[case("Top p is out of range.Invalid", "models.gpt-4o.top_p")]
   #[case(
-    "Provider HTTP URL is blank.Invalid",
-    "providers.openai.http.base_url"
+    "Retries exceed the maximum.Invalid",
+    "providers.openai.retries.max_retries"
   )]
-  #[case("Provider HTTP is absent.Invalid", "providers.openai.http")]
+  #[case("Provider header is malformed.Invalid", "providers.openai.headers")]
+  #[case("Provider credential is missing.Invalid", "providers.openai.api_key")]
+  #[case("Identity with a non-OpenAI provider.Invalid", "transport.identity")]
   #[case("Model provider is unknown.Invalid", "models.gpt-4o.provider")]
   #[case("Default model is unknown.Invalid", "defaults.model")]
   #[case("Agent model is unknown.Invalid", "agents[0].model.id")]
@@ -594,7 +713,7 @@ mod tests {
     #[case] expected_path: &str,
   ) {
     let mut providers = vec![provider("openai")];
-    let mut http = None;
+    let mut transport = None;
     let mut models = vec![Model::new("gpt-4o", "openai")];
     let mut defaults = Defaults::default();
     let mut agents = Vec::new();
@@ -602,14 +721,78 @@ mod tests {
     match case_id {
       "Providers are empty.Invalid" => providers.clear(),
       "Models are empty.Invalid" => models.clear(),
-      "Platform HTTP URL is blank.Invalid" => {
-        http = Some(Http::new(" "));
+      "Transport timeout is zero.Invalid" => {
+        transport = Some(
+          TransportBuilder::default()
+            .timeout_ms(0)
+            .build()
+            .expect("no required fields"),
+        );
       }
-      "Provider HTTP URL is blank.Invalid" => {
-        providers = vec![provider_with_http("openai", Http::new(" "))];
+      "Temperature is out of range.Invalid" => {
+        models = vec![model_with(
+          GenerationBuilder::default()
+            .temperature(2.5)
+            .build()
+            .expect("no required fields"),
+        )];
       }
-      "Provider HTTP is absent.Invalid" => {
-        providers = vec![provider_without_http("openai")];
+      "Top p is out of range.Invalid" => {
+        models = vec![model_with(
+          GenerationBuilder::default()
+            .top_p(1.5)
+            .build()
+            .expect("no required fields"),
+        )];
+      }
+      "Retries exceed the maximum.Invalid" => {
+        providers = vec![
+          ProviderBuilder::default()
+            .name("openai".to_owned())
+            .kind(ProviderId::resolve("openai").expect("registered"))
+            .api_key(Secret::Literal("test-api-key".to_owned()))
+            .retries(
+              RetriesBuilder::default()
+                .max_retries(11)
+                .backoff_ms(10)
+                .build()
+                .expect("no required fields"),
+            )
+            .build()
+            .expect("provider builder has all required fields"),
+        ];
+      }
+      "Provider header is malformed.Invalid" => {
+        providers = vec![
+          ProviderBuilder::default()
+            .name("openai".to_owned())
+            .kind(ProviderId::resolve("openai").expect("registered"))
+            .api_key(Secret::Literal("test-api-key".to_owned()))
+            .headers(std::collections::HashMap::from([(
+              "bad header".to_owned(),
+              "value".to_owned(),
+            )]))
+            .build()
+            .expect("provider builder has all required fields"),
+        ];
+      }
+      "Provider credential is missing.Invalid" => {
+        providers = vec![
+          ProviderBuilder::default()
+            .name("openai".to_owned())
+            .kind(ProviderId::resolve("openai").expect("registered"))
+            .build()
+            .expect("provider builder has all required fields"),
+        ];
+      }
+      "Identity with a non-OpenAI provider.Invalid" => {
+        providers.push(provider_of("backup", "anthropic"));
+        transport = Some(
+          TransportBuilder::default()
+            .identity(CallerIdentity::new("carisa"))
+            .build()
+            .expect("no required fields"),
+        );
       }
       "Model provider is unknown.Invalid" => {
         *models.first_mut().expect("model exists for this case") =
@@ -632,7 +815,7 @@ mod tests {
 
     let platform = AgentPlatform::new(
       providers,
-      http,
+      transport,
       models,
       defaults,
       agents,
@@ -643,26 +826,35 @@ mod tests {
     assert!(error.to_string().contains(expected_path));
   }
 
+  /// A `gpt-4o` model definition with `generation`.
+  fn model_with(generation: Generation) -> Model {
+    ModelBuilder::default()
+      .id("gpt-4o".to_owned())
+      .provider("openai".to_owned())
+      .generation(generation)
+      .build()
+      .expect("model builder has all required fields")
+  }
+
   #[rstest]
   #[case(
     "File loads all fields.All values preserved",
     r#"{
+      "schema_version": 1,
       "providers": {"openai": {
         "name": "openai",
         "kind": "openai",
         "api_key": {"literal": "file-key"},
-        "http": {
-          "base_url": "https://provider.example",
-          "headers": {"x-test": "yes"},
-          "options": {"timeout": 30}
-        },
+        "base_url": "https://provider.example",
+        "headers": {"x-test": "yes"},
         "retries": {"max_retries": 7, "backoff_ms": 125},
         "tls": {"insecure_skip_verify": true, "ca_file": "/tmp/ca.pem"}
       }},
-      "http": {
-        "base_url": "https://platform.example",
-        "headers": {"x-platform": "yes"},
-        "options": {"proxy": "https://proxy.example"}
+      "transport": {
+        "timeout_ms": 30000,
+        "connect_timeout_ms": 5000,
+        "proxy": "http://proxy.example:3128",
+        "default_headers": {"x-platform": "yes"}
       },
       "models": {"gpt-4o": {
         "id": "gpt-4o",
@@ -671,22 +863,23 @@ mod tests {
         "generation": {
           "temperature": 0.25,
           "max_tokens": 2048,
+          "top_p": 0.9,
+          "seed": 7,
           "additional_params": {"reasoning_effort": "high"}
         }
       }},
-      "defaults": {"model": "gpt-4o"},
-      "agents": [{"instructions": "External agent"}]
+      "defaults": {"model": "gpt-4o"}
     }"#
   )]
   #[case(
     "File omits optional fields.Defaults applied",
     r#"{
+      "schema_version": 1,
       "providers": {"openai": {
         "name": "openai",
         "kind": "openai",
         "api_key": {"literal": "file-key"}
       }},
-      "http": {"base_url": "https://platform.example"},
       "models": {"gpt-4o": {
         "id": "gpt-4o",
         "provider": "openai"
@@ -709,25 +902,26 @@ mod tests {
     assert_eq!(platform.models.len(), 1);
     assert!(platform.agents.is_empty(), "agents are builder-only");
     assert_serde_round_trip(loaded_provider);
-    assert_serde_round_trip(&platform.http);
+    assert_serde_round_trip(&platform.transport);
     assert_serde_round_trip(loaded_model);
     assert_serde_round_trip(&platform.defaults);
 
     if case_id.starts_with("File loads all fields") {
-      assert_eq!(loaded_provider.kind(), &ProviderKind::OpenAI);
+      assert_eq!(
+        loaded_provider.kind(),
+        &ProviderId::resolve("openai").expect("openai is registered")
+      );
       assert_eq!(
         loaded_provider.api_key(),
-        &Secret::Literal("file-key".into())
+        Some(&Secret::Literal("file-key".into()))
       );
-      let provider_http = loaded_provider.http().expect("provider HTTP loaded");
-      assert_eq!(provider_http.base_url(), "https://provider.example");
       assert_eq!(
-        provider_http.headers().get("x-test").map(String::as_str),
+        loaded_provider.base_url().map(url::Url::as_str),
+        Some("https://provider.example/")
+      );
+      assert_eq!(
+        loaded_provider.headers().get("x-test").map(String::as_str),
         Some("yes")
-      );
-      assert_eq!(
-        provider_http.options().get("timeout"),
-        Some(&serde_json::json!(30))
       );
       assert_eq!(loaded_provider.retries().max_retries(), 7);
       assert_eq!(loaded_provider.retries().backoff_ms(), 125);
@@ -741,22 +935,25 @@ mod tests {
             .expect("TLS builder has no required fields")
         )
       );
-      let platform_http = platform.http.as_ref().expect("platform HTTP loaded");
-      assert_eq!(platform_http.base_url(), "https://platform.example");
+      let transport = platform.transport.as_ref().expect("transport loaded");
+      assert_eq!(transport.timeout_ms(), Some(30_000));
+      assert_eq!(transport.connect_timeout_ms(), Some(5_000));
       assert_eq!(
-        platform_http
-          .headers()
+        transport.proxy().map(url::Url::as_str),
+        Some("http://proxy.example:3128/")
+      );
+      assert_eq!(
+        transport
+          .default_headers()
           .get("x-platform")
           .map(String::as_str),
         Some("yes")
       );
-      assert_eq!(
-        platform_http.options().get("proxy"),
-        Some(&serde_json::json!("https://proxy.example"))
-      );
       assert_eq!(loaded_model.name().map(String::as_str), Some("GPT 4o"));
       assert_eq!(loaded_model.generation().temperature(), Some(0.25));
       assert_eq!(loaded_model.generation().max_tokens(), Some(2048));
+      assert_eq!(loaded_model.generation().top_p(), Some(0.9));
+      assert_eq!(loaded_model.generation().seed(), Some(7));
       assert_eq!(
         loaded_model
           .generation()
@@ -770,10 +967,15 @@ mod tests {
       );
     } else {
       assert_eq!(loaded_provider.retries(), &Retries::default());
-      assert!(loaded_provider.http().is_none());
+      assert!(loaded_provider.base_url().is_none());
+      assert!(loaded_provider.headers().is_empty());
       assert!(loaded_provider.tls().is_none());
+      assert!(platform.transport.is_none());
       assert!(loaded_model.name().is_none());
-      assert_eq!(loaded_model.generation(), &Generation::default());
+      assert_eq!(
+        loaded_model.generation(),
+        &crate::agent::config::Generation::default()
+      );
       assert!(platform.defaults.model().is_none());
     }
   }
@@ -782,18 +984,17 @@ mod tests {
   fn builder_values_upsert_file_providers_and_models() {
     let builder = load_file_config(
       r#"{
+        "schema_version": 1,
         "providers": {"original": {
           "name": "original",
           "kind": "openai",
-          "api_key": {"literal": "file-key"},
-          "http": {"base_url": "https://original.example"}
+          "api_key": {"literal": "file-key"}
         }},
         "models": {"original-model": {
           "id": "original-model",
           "provider": "original"
         }},
-        "defaults": {"model": "original-model"},
-        "agents": [{"instructions": "Ignored"}]
+        "defaults": {"model": "original-model"}
       }"#,
     );
     let agent = crate::agent::AgentBuilder::default()
@@ -802,9 +1003,8 @@ mod tests {
       .expect("instructions provided");
     let updated_provider = ProviderBuilder::default()
       .name("original".to_owned())
-      .kind(ProviderKind::OpenAI)
+      .kind(ProviderId::resolve("openai").expect("registered"))
       .api_key(Secret::Literal("builder-key".to_owned()))
-      .http(Http::new("https://original.example"))
       .build()
       .expect("provider builder has all required fields");
     let updated_model = ModelBuilder::default()
@@ -839,7 +1039,7 @@ mod tests {
         .providers
         .iter()
         .find(|item| item.name() == "original")
-        .map(Provider::api_key),
+        .and_then(Provider::api_key),
       Some(&Secret::Literal("builder-key".to_owned()))
     );
     assert_eq!(platform.models.len(), 2);
@@ -879,13 +1079,13 @@ mod tests {
     let mut builder = AgentPlatformBuilder::default();
     builder
       .merge_json_value(serde_json::json!({
-        "providers": {"first": {
+        "schema_version": 1,
+        "providers": {"openai": {
           "name": "openai",
           "kind": "openai",
-          "api_key": {"literal": "first-key"},
-          "http": {"base_url": "https://first.example"}
+          "api_key": {"literal": "first-key"}
         }},
-        "models": {"first": {
+        "models": {"model-id": {
           "id": "model-id",
           "provider": "openai"
         }}
@@ -893,13 +1093,13 @@ mod tests {
       .expect("first source merges");
     builder
       .merge_json_value(serde_json::json!({
-        "providers": {"second": {
+        "schema_version": 1,
+        "providers": {"openai": {
           "name": "openai",
           "kind": "openai",
-          "api_key": {"literal": "second-key"},
-          "http": {"base_url": "https://second.example"}
+          "api_key": {"literal": "second-key"}
         }},
-        "models": {"second": {
+        "models": {"model-id": {
           "id": "model-id",
           "name": "Replacement",
           "provider": "openai"
@@ -913,7 +1113,7 @@ mod tests {
         .providers
         .as_ref()
         .and_then(|items| items.first())
-        .map(Provider::api_key),
+        .and_then(Provider::api_key),
       Some(&Secret::Literal("second-key".to_owned()))
     );
     assert_eq!(builder.models.as_ref().map(Vec::len), Some(1));
@@ -929,35 +1129,138 @@ mod tests {
   }
 
   #[rstest]
-  #[case("Environment loads all fields.All values preserved", "full")]
-  #[case("Environment omits optional fields.Defaults applied", "minimal")]
-  fn from_env_loads_in_isolated_process(
+  #[case(
+    "Provider map key differs from name",
+    r#"{"providers": {"alias": {"name": "openai", "kind": "openai",
+        "api_key": {"literal": "key"}}}}"#,
+    "providers.alias"
+  )]
+  #[case(
+    "Model map key differs from id",
+    r#"{"models": {"alias": {"id": "gpt-4o", "provider": "openai"}}}"#,
+    "models.alias"
+  )]
+  #[case("Unknown section", r#"{"providers_typo": {}}"#, "providers_typo")]
+  #[case(
+    "Unknown provider kind",
+    r#"{"providers": {"openai": {"name": "openai", "kind": "nope"}}}"#,
+    "providers.openai.kind"
+  )]
+  #[case(
+    "Ambiguous provider kind",
+    r#"{"providers": {"minimax": {"name": "minimax", "kind": "minimax"}}}"#,
+    "providers.minimax.kind"
+  )]
+  #[case(
+    "Removed openai_compatible kind",
+    r#"{"providers": {"gateway": {"name": "gateway",
+        "kind": "openai_compatible"}}}"#,
+    "providers.gateway.kind"
+  )]
+  fn json_sources_reject_unknown_keys_and_kinds(
     #[case] case_id: &str,
-    #[case] scenario: &str,
+    #[case] section: &str,
+    #[case] expected_path: &str,
   ) {
-    assert!(case_id.starts_with("Environment "));
-    let test_binary =
-      std::env::current_exe().expect("test binary is available");
-    let inherited = std::env::vars_os()
-      .filter(|(key, _)| !key.to_string_lossy().starts_with("CARISA_"));
-    let mut command = std::process::Command::new(test_binary);
-    command
-      .args([
-        "--exact",
-        "runtime::platform::tests::from_env_child_process",
-        "--nocapture",
-      ])
-      .env_clear()
-      .envs(inherited)
-      .env("RUST_TEST_THREADS", "1")
-      .env("CARISA_TEST_CHILD", "1")
-      .env("CARISA_TEST_CASE", scenario);
+    assert_ne!(case_id, "");
+    let mut root: serde_json::Value =
+      serde_json::from_str(section).expect("case is valid JSON");
+    root
+      .as_object_mut()
+      .expect("every case is an object")
+      .insert("schema_version".to_owned(), serde_json::json!(1));
+    let error = AgentPlatformBuilder::default()
+      .merge_json_value(root)
+      .expect_err("the source is invalid");
 
-    for (key, value) in env_config(scenario) {
-      command.env(key, value);
-    }
+    assert!(
+      error.to_string().contains(expected_path),
+      "`{case_id}` reported `{error}`, expected `{expected_path}`"
+    );
+  }
 
-    let output = command.output().expect("child test process runs");
+  #[test]
+  fn provider_kind_hints_at_the_openai_gateway_composition() {
+    let error = AgentPlatformBuilder::default()
+      .merge_json_value(serde_json::json!({
+        "schema_version": 1,
+        "providers": {"gateway": {
+          "name": "gateway",
+          "kind": "openai_compatible"
+        }}
+      }))
+      .expect_err("the kind was removed");
+
+    assert!(error.to_string().contains("base_url"));
+  }
+
+  #[test]
+  fn ambiguous_kind_names_the_qualified_alternatives() {
+    let error = AgentPlatformBuilder::default()
+      .merge_json_value(serde_json::json!({
+        "schema_version": 1,
+        "providers": {"minimax": {"name": "minimax", "kind": "minimax"}}
+      }))
+      .expect_err("minimax registers more than one format");
+
+    assert!(error.to_string().contains("minimax/anthropic"));
+    assert!(error.to_string().contains("minimax/openai"));
+  }
+
+  #[rstest]
+  #[case("Missing schema version", "{}")]
+  #[case("Unsupported schema version", r#"{"schema_version": 2}"#)]
+  #[case("Non-numeric schema version", r#"{"schema_version": "1"}"#)]
+  fn schema_version_is_required_and_pinned(
+    #[case] case_id: &str,
+    #[case] content: &str,
+  ) {
+    assert_ne!(case_id, "");
+    let value: serde_json::Value =
+      serde_json::from_str(content).expect("case is valid JSON");
+
+    assert!(
+      AgentPlatformBuilder::default()
+        .merge_json_value(value)
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn from_env_path_loads_the_named_file() {
+    let path = std::env::temp_dir()
+      .join(format!("carisa-platform-{}.json", ulid::Ulid::generate()));
+    fs::write(
+      &path,
+      r#"{
+        "schema_version": 1,
+        "providers": {"openai": {
+          "name": "openai",
+          "kind": "openai",
+          "api_key": {"env": "OPENAI_API_KEY"}
+        }},
+        "models": {"gpt-4o": {"id": "gpt-4o", "provider": "openai"}},
+        "defaults": {"model": "gpt-4o"}
+      }"#,
+    )
+    .expect("temporary config is written");
+
+    let output = run_child(Some(path.as_os_str()), "ok");
+    let removed = fs::remove_file(&path);
+
+    assert!(
+      output.status.success(),
+      "child test failed: {}{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    removed.expect("temporary config is removed");
+  }
+
+  #[test]
+  fn from_env_path_requires_the_variable() {
+    let output = run_child(None, "missing");
+
     assert!(
       output.status.success(),
       "child test failed: {}{}",
@@ -966,182 +1269,59 @@ mod tests {
     );
   }
 
-  fn env_config(scenario: &str) -> Vec<(&'static str, &'static str)> {
-    let common = vec![
-      ("CARISA_PROVIDERS__OPENAI__NAME", "openai"),
-      ("CARISA_PROVIDERS__OPENAI__KIND", "openai"),
-      ("CARISA_PROVIDERS__OPENAI__API_KEY__LITERAL", "env-key"),
-      ("CARISA_HTTP__BASE_URL", "https://platform.example"),
-      ("CARISA_MODELS__GPT-4O__ID", "gpt-4o"),
-      ("CARISA_MODELS__GPT-4O__PROVIDER", "openai"),
-      ("CARISA_AGENTS", r#"[{"instructions":"External agent"}]"#),
-    ];
-    if scenario == "minimal" {
-      return common;
+  /// Runs [`Self::from_env_path_child`] in a fresh process, so the
+  /// environment can differ from the test runner's.
+  fn run_child(
+    path: Option<&std::ffi::OsStr>,
+    expectation: &str,
+  ) -> std::process::Output {
+    let test_binary =
+      std::env::current_exe().expect("test binary is available");
+    let mut command = std::process::Command::new(test_binary);
+    command
+      .args([
+        "--exact",
+        "agent::platform::tests::from_env_path_child",
+        "--nocapture",
+      ])
+      .env("RUST_TEST_THREADS", "1")
+      .env("CARISA_TEST_CHILD", "1")
+      .env("CARISA_TEST_EXPECT", expectation)
+      .env_remove("CARISA_CONFIG_PATH");
+    if let Some(path) = path {
+      command.env("CARISA_CONFIG_PATH", path);
     }
 
-    [
-      common,
-      vec![
-        (
-          "CARISA_PROVIDERS__OPENAI__HTTP__BASE_URL",
-          "https://provider.example",
-        ),
-        ("CARISA_PROVIDERS__OPENAI__HTTP__HEADERS__X-TEST", "yes"),
-        ("CARISA_PROVIDERS__OPENAI__HTTP__OPTIONS__TIMEOUT", "30"),
-        ("CARISA_PROVIDERS__OPENAI__RETRIES__MAX_RETRIES", "7"),
-        ("CARISA_PROVIDERS__OPENAI__RETRIES__BACKOFF_MS", "125"),
-        ("CARISA_PROVIDERS__OPENAI__TLS__INSECURE_SKIP_VERIFY", "true"),
-        ("CARISA_PROVIDERS__OPENAI__TLS__CA_FILE", "/tmp/ca.pem"),
-        ("CARISA_HTTP__HEADERS__X-PLATFORM", "yes"),
-        (
-          "CARISA_HTTP__OPTIONS__PROXY",
-          "https://proxy.example",
-        ),
-        ("CARISA_MODELS__GPT-4O__NAME", "GPT 4o"),
-        (
-          "CARISA_MODELS__GPT-4O__GENERATION__TEMPERATURE",
-          "0.25",
-        ),
-        ("CARISA_MODELS__GPT-4O__GENERATION__MAX_TOKENS", "2048"),
-        (
-          "CARISA_MODELS__GPT-4O__GENERATION__ADDITIONAL_PARAMS__REASONING_EFFORT",
-          "high",
-        ),
-        ("CARISA_DEFAULTS__MODEL", "gpt-4o"),
-      ],
-    ]
-    .concat()
+    command.output().expect("child test process runs")
   }
 
   #[test]
-  fn from_env_child_process() {
+  fn from_env_path_child() {
     if std::env::var_os("CARISA_TEST_CHILD").is_none() {
       return;
     }
 
-    let scenario = std::env::var("CARISA_TEST_CASE")
-      .expect("parent provides an environment case");
-    let builder = AgentPlatformBuilder::from_env().expect("environment loads");
-    let platform = builder
-      .clone()
-      .log_storage(Arc::new(InMemoryLogStorage::new()))
-      .build()
-      .expect("environment values build");
-    assert_loaded_env_config(&platform, &scenario);
-
-    let agent = crate::agent::AgentBuilder::default()
-      .instructions("Builder agent".to_owned())
-      .build()
-      .expect("instructions provided");
-    let overridden = builder
-      .providers(vec![provider("replacement"), provider("openai")])
-      .models(vec![
-        Model::new("replacement-model", "replacement"),
-        Model::new("gpt-4o", "replacement"),
-      ])
-      .default_model("replacement-model")
-      .agent(agent)
-      .log_storage(Arc::new(InMemoryLogStorage::new()))
-      .build()
-      .expect("builder overrides environment values");
-
-    assert_eq!(overridden.providers.len(), 2);
-    assert_eq!(
-      overridden
-        .providers
-        .iter()
-        .find(|item| item.name() == "openai")
-        .map(Provider::api_key),
-      Some(&Secret::Literal("test-api-key".to_owned()))
-    );
-    assert_eq!(overridden.models.len(), 2);
-    assert_eq!(
-      overridden
-        .models
-        .iter()
-        .find(|item| item.id() == "gpt-4o")
-        .map(Model::provider),
-      Some("replacement")
-    );
-    assert_eq!(overridden.agents.len(), 1);
-  }
-
-  fn assert_loaded_env_config(platform: &AgentPlatform, scenario: &str) {
-    let loaded_provider = platform.providers.first().expect("provider loaded");
-    let loaded_model = platform.models.first().expect("model loaded");
-
-    assert_eq!(
-      loaded_provider.api_key(),
-      &Secret::Literal("env-key".into())
-    );
-    assert_eq!(
-      platform.http.as_ref().map(Http::base_url),
-      Some("https://platform.example")
-    );
-    assert!(platform.agents.is_empty(), "agents are builder-only");
-    assert_serde_round_trip(loaded_provider);
-    assert_serde_round_trip(&platform.http);
-    assert_serde_round_trip(loaded_model);
-    assert_serde_round_trip(&platform.defaults);
-
-    if scenario == "full" {
-      assert_eq!(loaded_provider.kind(), &ProviderKind::OpenAI);
-      assert_eq!(loaded_provider.retries().max_retries(), 7);
-      assert_eq!(loaded_provider.retries().backoff_ms(), 125);
-      let provider_http = loaded_provider.http().expect("provider HTTP loaded");
-      assert_eq!(provider_http.base_url(), "https://provider.example");
-      assert_eq!(
-        provider_http.headers().get("x-test").map(String::as_str),
-        Some("yes")
-      );
-      assert_eq!(
-        provider_http.options().get("timeout"),
-        Some(&serde_json::json!(30))
-      );
-      assert_eq!(
-        loaded_provider.tls(),
-        Some(
-          &TlsBuilder::default()
-            .insecure_skip_verify(true)
-            .ca_file("/tmp/ca.pem".to_owned())
-            .build()
-            .expect("TLS builder has no required fields")
-        )
-      );
-      let platform_http = platform.http.as_ref().expect("platform HTTP loaded");
-      assert_eq!(
-        platform_http
-          .headers()
-          .get("x-platform")
-          .map(String::as_str),
-        Some("yes")
-      );
-      assert_eq!(
-        platform_http.options().get("proxy"),
-        Some(&serde_json::json!("https://proxy.example"))
-      );
-      assert_eq!(loaded_model.name().map(String::as_str), Some("GPT 4o"));
-      assert_eq!(loaded_model.generation().temperature(), Some(0.25));
-      assert_eq!(loaded_model.generation().max_tokens(), Some(2048));
-      assert_eq!(
-        loaded_model
-          .generation()
-          .additional_params()
-          .get("reasoning_effort"),
-        Some(&serde_json::json!("high"))
-      );
-      assert_eq!(
-        platform.defaults.model().map(String::as_str),
-        Some("gpt-4o")
-      );
-    } else {
-      assert_eq!(loaded_provider.retries(), &Retries::default());
-      assert!(loaded_provider.http().is_none());
-      assert!(loaded_provider.tls().is_none());
-      assert!(loaded_model.name().is_none());
-      assert_eq!(loaded_model.generation(), &Generation::default());
-      assert!(platform.defaults.model().is_none());
+    let expectation = std::env::var("CARISA_TEST_EXPECT")
+      .expect("parent provides an expectation");
+    match expectation.as_str() {
+      "ok" => {
+        let platform = AgentPlatformBuilder::from_env_path()
+          .expect("the variable names a readable file")
+          .log_storage(Arc::new(InMemoryLogStorage::new()))
+          .build()
+          .expect("the file config builds");
+        assert_eq!(platform.providers.len(), 1);
+        assert_eq!(
+          platform.defaults.model().map(String::as_str),
+          Some("gpt-4o")
+        );
+      }
+      "missing" => {
+        let error = AgentPlatformBuilder::from_env_path()
+          .expect_err("the variable is absent");
+        assert!(error.to_string().contains("CARISA_CONFIG_PATH"));
+      }
+      other => unreachable!("unknown expectation `{other}`"),
     }
   }
 
@@ -1170,64 +1350,110 @@ mod tests {
   }
 
   #[test]
-  fn providers_require_http_when_platform_http_is_absent() {
-    let provider_without_http = provider_without_http("backup");
+  fn provider_without_a_base_url_uses_the_dialect_endpoint() {
+    let platform = valid_builder()
+      .build()
+      .expect("a provider inherits the dialect's endpoint");
+
+    assert!(platform.providers().iter().all(|p| p.base_url().is_none()));
+  }
+
+  #[test]
+  fn transport_is_shared_and_optional() {
+    let transport = TransportBuilder::default()
+      .timeout_ms(1200)
+      .build()
+      .expect("no required fields");
+    let platform = valid_builder()
+      .transport(transport.clone())
+      .build()
+      .expect("a shared transport is enough");
+
+    assert_eq!(platform.transport(), Some(&transport));
+
+    let without = valid_builder().build().expect("transport is optional");
+
+    assert!(without.transport().is_none());
+  }
+
+  #[test]
+  fn invalid_base_url_is_rejected_when_loading_json() {
+    let mut builder = AgentPlatformBuilder::default();
+    let error = builder
+      .merge_json_value(serde_json::json!({
+        "schema_version": 1,
+        "providers": {"gateway": {
+          "name": "gateway",
+          "kind": "openai",
+          "base_url": "not a url"
+        }}
+      }))
+      .expect_err("the URL is malformed");
+
+    assert!(error.to_string().contains("providers.gateway"));
+  }
+
+  #[rstest]
+  #[case("OpenAI requires a credential", "openai", true)]
+  #[case("Ollama takes an optional credential", "ollama/openai", false)]
+  fn provider_credential_is_required_only_when_the_kind_needs_it(
+    #[case] case_id: &str,
+    #[case] kind: &str,
+    #[case] rejects: bool,
+  ) {
+    assert_ne!(case_id, "");
+    let provider = ProviderBuilder::default()
+      .name("local".to_owned())
+      .kind(ProviderId::resolve(kind).expect("kind is registered"))
+      .build()
+      .expect("provider builder has all required fields");
+    let platform = AgentPlatform::new(
+      vec![provider],
+      None,
+      vec![Model::new("gpt-4o", "local")],
+      Defaults::default(),
+      Vec::new(),
+      Arc::new(InMemoryLogStorage::new()),
+    );
+
+    assert_eq!(platform.validate().is_err(), rejects);
+  }
+
+  #[test]
+  fn catalog_rejects_temperature_a_model_cannot_take() {
     let error = AgentPlatformBuilder::default()
-      .providers(vec![provider("openai"), provider_without_http])
-      .models(vec![Model::new("gpt-4o", "openai")])
+      .providers(vec![
+        ProviderBuilder::default()
+          .name("anthropic".to_owned())
+          .kind(ProviderId::resolve("anthropic").expect("registered"))
+          .api_key(Secret::Literal("test-api-key".to_owned()))
+          .build()
+          .expect("provider builder has all required fields"),
+      ])
+      .models(vec![
+        ModelBuilder::default()
+          .id("claude-fable-5".to_owned())
+          .provider("anthropic".to_owned())
+          .generation(
+            GenerationBuilder::default()
+              .temperature(0.5)
+              .build()
+              .expect("no required fields"),
+          )
+          .build()
+          .expect("model builder has all required fields"),
+      ])
+      .default_model("claude-fable-5")
       .log_storage(Arc::new(InMemoryLogStorage::new()))
       .build()
-      .expect_err("provider HTTP settings are required");
+      .expect_err("the model refuses a temperature");
 
-    assert!(error.to_string().contains("providers.backup.http"));
-  }
-
-  #[test]
-  fn platform_http_allows_provider_http_to_be_absent() {
-    let first = provider_without_http("openai");
-    let second = provider_without_http("backup");
-    let platform = AgentPlatformBuilder::default()
-      .providers(vec![first, second])
-      .http(Http::new("https://api.example"))
-      .models(vec![Model::new("gpt-4o", "openai")])
-      .log_storage(Arc::new(InMemoryLogStorage::new()))
-      .build()
-      .expect("platform HTTP is sufficient");
-
-    assert!(platform.http.is_some());
-  }
-
-  #[test]
-  fn platform_rejects_empty_http_base_url() {
-    let error = valid_builder()
-      .http(Http::new(" "))
-      .build()
-      .expect_err("a blank base URL is not configured");
-
-    assert!(error.to_string().contains("http.base_url"));
-  }
-
-  #[test]
-  fn provider_rejects_empty_http_base_url() {
-    let provider_with_empty_url = provider_with_http("backup", Http::new(""));
-    let error = AgentPlatformBuilder::default()
-      .providers(vec![provider("openai"), provider_with_empty_url])
-      .models(vec![Model::new("gpt-4o", "openai")])
-      .log_storage(Arc::new(InMemoryLogStorage::new()))
-      .build()
-      .expect_err("a blank base URL is not configured");
-
-    assert!(error.to_string().contains("providers.backup.http.base_url"));
-  }
-
-  #[test]
-  fn provider_api_key_is_required() {
-    let result = serde_json::from_value::<Provider>(serde_json::json!({
-      "name": "backup",
-      "kind": "openai"
-    }));
-
-    assert!(result.is_err());
+    assert!(
+      error
+        .to_string()
+        .contains("models.claude-fable-5.temperature"),
+      "unexpected error: {error}"
+    );
   }
 
   #[test]
@@ -1241,17 +1467,17 @@ mod tests {
   fn invalid_provider_json_is_not_silently_discarded() {
     let mut builder = AgentPlatformBuilder::default();
     let result = builder.merge_json_value(serde_json::json!({
+      "schema_version": 1,
       "providers": {
         "openai": {
-          "name": "openai",
-          "kind": "openai"
+          "name": "openai"
         }
       }
     }));
 
     assert!(
       result
-        .expect_err("missing API key must fail deserialization")
+        .expect_err("a provider without `kind` must fail deserialization")
         .to_string()
         .contains("providers.openai")
     );

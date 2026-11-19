@@ -186,6 +186,7 @@ dependencies = [
  "redis",
  "redis-test",
  "rig-core",
+ "rig-reqwest",
  "rstest",
  "serde",
  "serde-saphyr",
@@ -2434,6 +2435,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
