@@ -6,8 +6,8 @@
 
 # Before marking done
 
-- Verify tests, formatting, lints, and documentation.
 - Update comments/docs if code changed.
+- Verify tests, doc tests, formatting, lints, and documentation.
 
 # Navigation
 

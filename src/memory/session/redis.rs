@@ -35,11 +35,12 @@
 //! # Write path (`append`)
 //!
 //! `append` reads the partition pointer (defaulting to `1`) and writes every
-//! conversation message with `HSET` into the active partition, inside one
-//! atomic pipeline. A preamble is written only if partition `0` is empty. A
-//! condensation increments the pointer with `INCR` first, so the message
-//! lands in the freshly opened partition. Missing or legacy pointers below
-//! `1` are normalized to `1` in the same pipeline.
+//! conversation message with `HSETNX` into the active partition, inside one
+//! atomic pipeline. Existing message ids are left unchanged. A preamble is
+//! written only if its id is absent from partition `0`. A condensation advances
+//! the pointer and writes its message only if the message id is absent from the
+//! newly opened partition. Missing or legacy pointers below `1` are normalized
+//! to `1` in the same pipeline.
 //!
 //! `append` is expected to receive few messages per call, so messages are
 //! compressed one by one.
@@ -93,9 +94,11 @@ const CURRENT_PARTITION_KEY_SUFFIX: &str = "current_partition";
 const INITIAL_PARTITION: i64 = 0;
 const FIRST_CONVERSATION_PARTITION: i64 = INITIAL_PARTITION + 1;
 
-const INSERT_PREAMBLE_IF_EMPTY: &str = concat!(
-  "if redis.call('EXISTS', KEYS[1]) == 0 then ",
-  "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) end; return 1",
+const INSERT_CONDENSATION_IF_ID_ABSENT: &str = concat!(
+  "if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then ",
+  "redis.call('INCR', KEYS[2]); ",
+  "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) ",
+  "return 1 else return 0 end",
 );
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
@@ -294,19 +297,8 @@ where
       .max(FIRST_CONVERSATION_PARTITION);
     let needs_pointer_init =
       current.is_none_or(|value| value < FIRST_CONVERSATION_PARTITION);
-    let has_preamble = encoded
-      .iter()
-      .any(|(_, _, etiqueta)| *etiqueta == Etiqueta::Preamble);
     let initial_partition_key =
       partition_key(agent_id, session_id, INITIAL_PARTITION);
-    let initial_partition_exists = if has_preamble {
-      redis::cmd("EXISTS")
-        .arg(&initial_partition_key)
-        .query_async(&mut connection)
-        .await?
-    } else {
-      false
-    };
 
     let mut pipeline = redis::pipe();
     pipeline.atomic();
@@ -317,27 +309,25 @@ where
     for (id, payload, etiqueta) in &encoded {
       match etiqueta {
         Etiqueta::Preamble => {
-          if !initial_partition_exists {
-            pipeline
-              .cmd("EVAL")
-              .arg(INSERT_PREAMBLE_IF_EMPTY)
-              .arg(1)
-              .arg(&initial_partition_key)
-              .arg(id)
-              .arg(payload);
-            has_pipeline_commands = true;
-          }
+          pipeline.hset_nx(&initial_partition_key, id, payload);
+          has_pipeline_commands = true;
         }
         Etiqueta::Condensation => {
-          pipeline.incr(&pointer_key, 1);
           partition = partition.saturating_add(1);
           let part_key = partition_key(agent_id, session_id, partition);
-          pipeline.hset(&part_key, id, payload);
+          pipeline
+            .cmd("EVAL")
+            .arg(INSERT_CONDENSATION_IF_ID_ABSENT)
+            .arg(2)
+            .arg(&part_key)
+            .arg(&pointer_key)
+            .arg(id)
+            .arg(payload);
           has_pipeline_commands = true;
         }
         Etiqueta::None => {
           let part_key = partition_key(agent_id, session_id, partition);
-          pipeline.hset(&part_key, id, payload);
+          pipeline.hset_nx(&part_key, id, payload);
           has_pipeline_commands = true;
         }
       }
@@ -546,7 +536,6 @@ fn decompress_all(payloads: Vec<Vec<u8>>) -> Result<Vec<LogMessage>, LogError> {
 mod tests {
   use redis::Value;
   use redis_test::{MockCmd, MockRedisConnection};
-  use rstest::rstest;
 
   use super::*;
 
@@ -611,7 +600,7 @@ mod tests {
     let expected_pipeline = redis::pipe()
       .atomic()
       .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
-      .hset(&part_key, &message.id, &payload)
+      .hset_nx(&part_key, &message.id, &payload)
       .clone();
 
     let mock = MockRedisConnection::new(vec![
@@ -633,14 +622,46 @@ mod tests {
     assert_eq!(ids, vec![message.id]);
   }
 
-  #[rstest]
-  #[case::preamble_then_user(false, true)]
-  #[case::existing_partition_skips_preamble(true, false)]
   #[tokio::test]
-  async fn append_keeps_a_single_preamble_in_the_initial_partition(
-    #[case] initial_partition_exists: bool,
-    #[case] append_user_message: bool,
-  ) {
+  async fn append_duplicate_message_uses_hsetnx_and_returns_existing_id() {
+    let agent_id = "agent-1";
+    let session_id = "sess-1";
+    let message =
+      sample_message("01J000000000000000000004", agent_id, session_id);
+
+    let json = serde_json::to_vec(&message).unwrap();
+    let payload = compress(&json, DEFAULT_ZSTD_LEVEL).unwrap();
+    let pointer_key = current_partition_key(agent_id, session_id);
+    let part_key =
+      partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
+
+    let expected_pipeline = redis::pipe()
+      .atomic()
+      .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
+      .hset_nx(&part_key, &message.id, &payload)
+      .clone();
+
+    let mock = MockRedisConnection::new(vec![
+      MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(Value::Nil)),
+      MockCmd::with_values(
+        expected_pipeline,
+        Ok(vec![Value::Array(vec![Value::Okay, Value::Int(0)])]),
+      ),
+    ])
+    .assert_all_commands_consumed();
+
+    let storage = storage_with_mock(mock, DEFAULT_COMPRESS_BLOCKING_THRESHOLD);
+
+    let ids = storage
+      .append(agent_id, session_id, vec![message.clone()])
+      .await
+      .expect("duplicate append should do no write");
+
+    assert_eq!(ids, vec![message.id]);
+  }
+
+  #[tokio::test]
+  async fn append_keeps_a_single_preamble_in_the_initial_partition() {
     let agent_id = "agent-1";
     let session_id = "sess-1";
     let preamble = LogMessage::with_id(
@@ -653,10 +674,7 @@ mod tests {
       Message::system("system prompt"),
     );
     let user = sample_message("01J000000000000000000011", agent_id, session_id);
-    let mut messages = vec![preamble.clone()];
-    if append_user_message {
-      messages.push(user.clone());
-    }
+    let messages = vec![preamble.clone(), user.clone()];
 
     let preamble_payload =
       compress(&serde_json::to_vec(&preamble).unwrap(), DEFAULT_ZSTD_LEVEL)
@@ -669,43 +687,24 @@ mod tests {
     let conversation_key =
       partition_key(agent_id, session_id, FIRST_CONVERSATION_PARTITION);
 
-    let mut expected_pipeline = redis::pipe();
-    expected_pipeline.atomic();
-    let mut pipeline_values = Vec::new();
-    if !initial_partition_exists {
-      expected_pipeline
-        .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
-        .cmd("EVAL")
-        .arg(INSERT_PREAMBLE_IF_EMPTY)
-        .arg(1)
-        .arg(&initial_key)
-        .arg(&preamble.id)
-        .arg(&preamble_payload);
-      pipeline_values.extend([Value::Okay, Value::Int(1)]);
-    }
-    if append_user_message {
-      expected_pipeline.hset(&conversation_key, &user.id, &user_payload);
-      pipeline_values.push(Value::Int(1));
-    }
+    let expected_pipeline = redis::pipe()
+      .atomic()
+      .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
+      .hset_nx(&initial_key, &preamble.id, &preamble_payload)
+      .hset_nx(&conversation_key, &user.id, &user_payload)
+      .clone();
 
-    let mut commands = vec![MockCmd::new(
-      redis::cmd("GET").arg(&pointer_key),
-      if initial_partition_exists {
-        Ok(Value::Int(FIRST_CONVERSATION_PARTITION))
-      } else {
-        Ok(Value::Nil)
-      },
-    )];
-    commands.push(MockCmd::new(
-      redis::cmd("EXISTS").arg(&initial_key),
-      Ok(initial_partition_exists),
-    ));
-    if !initial_partition_exists || append_user_message {
-      commands.push(MockCmd::with_values(
+    let commands = vec![
+      MockCmd::new(redis::cmd("GET").arg(&pointer_key), Ok(Value::Nil)),
+      MockCmd::with_values(
         expected_pipeline,
-        Ok(vec![Value::Array(pipeline_values)]),
-      ));
-    }
+        Ok(vec![Value::Array(vec![
+          Value::Okay,
+          Value::Int(1),
+          Value::Int(1),
+        ])]),
+      ),
+    ];
 
     let mock =
       MockRedisConnection::new(commands).assert_all_commands_consumed();
@@ -736,8 +735,13 @@ mod tests {
 
     let expected_pipeline = redis::pipe()
       .atomic()
-      .incr(&pointer_key, 1)
-      .hset(&part_key, &message.id, &payload)
+      .cmd("EVAL")
+      .arg(INSERT_CONDENSATION_IF_ID_ABSENT)
+      .arg(2)
+      .arg(&part_key)
+      .arg(&pointer_key)
+      .arg(&message.id)
+      .arg(&payload)
       .clone();
 
     let mock = MockRedisConnection::new(vec![
@@ -775,8 +779,13 @@ mod tests {
     let expected_pipeline = redis::pipe()
       .atomic()
       .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
-      .incr(&pointer_key, 1)
-      .hset(&part_key, &message.id, &payload)
+      .cmd("EVAL")
+      .arg(INSERT_CONDENSATION_IF_ID_ABSENT)
+      .arg(2)
+      .arg(&part_key)
+      .arg(&pointer_key)
+      .arg(&message.id)
+      .arg(&payload)
       .clone();
 
     let mock = MockRedisConnection::new(vec![
@@ -825,10 +834,15 @@ mod tests {
     let expected_pipeline = redis::pipe()
       .atomic()
       .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
-      .hset(&part1, &m1.id, &payload1)
-      .incr(&pointer_key, 1)
-      .hset(&part2, &m2.id, &payload2)
-      .hset(&part2, &m3.id, &payload3)
+      .hset_nx(&part1, &m1.id, &payload1)
+      .cmd("EVAL")
+      .arg(INSERT_CONDENSATION_IF_ID_ABSENT)
+      .arg(2)
+      .arg(&part2)
+      .arg(&pointer_key)
+      .arg(&m2.id)
+      .arg(&payload2)
+      .hset_nx(&part2, &m3.id, &payload3)
       .clone();
 
     let mock = MockRedisConnection::new(vec![
@@ -891,7 +905,7 @@ mod tests {
     let expected_pipeline = redis::pipe()
       .atomic()
       .set(&pointer_key, FIRST_CONVERSATION_PARTITION)
-      .hset(&part_key, &message.id, &payload)
+      .hset_nx(&part_key, &message.id, &payload)
       .clone();
 
     let mock = MockRedisConnection::new(vec![
