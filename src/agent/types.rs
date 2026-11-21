@@ -104,6 +104,12 @@ impl Agent {
   pub const fn model(&self) -> Option<&AgentModel> {
     self.model.as_ref()
   }
+
+  pub(crate) fn into_runtime_parts(
+    self,
+  ) -> (String, Vec<PlatformSkill>, Vec<DomainSkill>) {
+    (self.instructions, self.platform_skills, self.domain_skills)
+  }
 }
 
 #[cfg(test)]

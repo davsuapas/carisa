@@ -119,6 +119,16 @@ impl LogMessage {
     )
   }
 
+  /// Stores an existing Rig system message as the session preamble.
+  #[must_use]
+  pub fn preamble_message(
+    agent_id: &str,
+    session_id: &str,
+    message: Message,
+  ) -> Self {
+    Self::labeled(agent_id, session_id, Etiqueta::Preamble, message)
+  }
+
   /// A condensation summary, stored as a user message.
   ///
   /// The storage backend opens a new partition with it.
@@ -289,6 +299,21 @@ mod tests {
 
     assert_eq!(log.etiqueta, Etiqueta::Preamble);
     assert!(matches!(log.message, Message::System { .. }));
+  }
+
+  #[test]
+  fn preamble_message_preserves_rig_message_and_identity() {
+    let message = Message::system("system prompt");
+    let expected = serde_json::to_value(&message).expect("message serializes");
+    let log = LogMessage::preamble_message("agent", "session", message);
+
+    assert_eq!(log.agent_id, "agent");
+    assert_eq!(log.session_id, "session");
+    assert_eq!(log.etiqueta, Etiqueta::Preamble);
+    assert_eq!(
+      serde_json::to_value(&log.message).expect("message serializes"),
+      expected
+    );
   }
 
   #[test]

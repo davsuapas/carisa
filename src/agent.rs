@@ -18,6 +18,8 @@
 //! represents a runtime capability and can be marked to load automatically
 //! for every agent session. Build skills separately and provide them to the
 //! corresponding builder fields.
+//! The crate-private agent runtime materializes an agent's skill manager and
+//! builds the system-message preamble without adding it to conversation history.
 //!
 //! ```rust
 //! use carisa_core::{AgentBuilder, AgentModel, DomainSkillBuilder};
@@ -176,7 +178,8 @@ pub mod connect;
 pub mod error;
 pub mod platform;
 pub mod provider;
-pub mod resolve;
+mod resolve;
+mod runtime;
 pub mod secret;
 pub mod types;
 
@@ -184,6 +187,5 @@ pub use config::Transport;
 pub use error::PlatformError;
 pub use platform::{AgentPlatform, AgentPlatformBuilder};
 pub use provider::ProviderId;
-pub use resolve::ResolvedModel;
 pub use secret::Secret;
 pub use types::{Agent, AgentBuilder, AgentModel};

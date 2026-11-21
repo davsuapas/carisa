@@ -65,6 +65,10 @@ This section outranks style and brevity.
 - Do not optimize without an identified bottleneck.
 - Clone / `Cow` / iterator / signature rules are basic hygiene, not speculative optimization.
 
+# Constructors (`new` / `from_*`)
+
+- `new()` solo para construir desde valores sueltos (barato, sin I/O ni lógica compleja); si se construye desde otro objeto o representación usa `from_<origen>` (o el trait `From`/`TryFrom` si hay un único origen obvio), nunca `new`.
+
 # Builders (`derive_builder`)
 
 - Use `derive_builder` for structs with optional or validated fields when possible.

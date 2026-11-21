@@ -401,7 +401,7 @@ impl AgentPlatform {
   ///
   /// [`PlatformError::Invalid`] at the offending path, or
   /// [`PlatformError::SchemaVersion`] for an unsupported schema.
-  pub fn validate(&self) -> Result<(), PlatformError> {
+  pub(crate) fn validate(&self) -> Result<(), PlatformError> {
     if self.providers.is_empty() {
       return Err(PlatformError::invalid(
         "providers",

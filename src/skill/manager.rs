@@ -27,6 +27,10 @@ impl SkillPrompt {
     self.full.to_string()
   }
 
+  pub(crate) fn as_str(&self) -> &str {
+    &self.full
+  }
+
   /// Returns `true` when this skill should be auto-loaded into the session.
   pub const fn always_load(&self) -> bool {
     self.always_load
@@ -38,8 +42,9 @@ impl SkillPrompt {
 /// The manager is constructed once, keeps a compact in-memory index keyed by
 /// skill id, and exposes a read-only API for bootstrap and catalog prompts.
 #[derive(Debug)]
-struct SkillManager {
+pub(crate) struct SkillManager {
   /// All loaded skills indexed by their unique identifier.
+  #[cfg_attr(not(test), expect(dead_code))]
   skills: HashMap<String, SkillPrompt>,
   /// Skills that are always loaded without user request.
   bootstrap: Vec<SkillPrompt>,
@@ -47,10 +52,12 @@ struct SkillManager {
   catalog: Option<SkillPrompt>,
 }
 
-#[expect(dead_code)]
 impl SkillManager {
   /// Builds a manager from platform and domain skill definitions.
-  fn new(platform: Vec<PlatformSkill>, domain: Vec<DomainSkill>) -> Self {
+  pub(crate) fn new(
+    platform: Vec<PlatformSkill>,
+    domain: Vec<DomainSkill>,
+  ) -> Self {
     let mut skills =
       HashMap::with_capacity(platform.len().saturating_add(domain.len()));
     let mut bootstrap = Vec::with_capacity(platform.len());
@@ -120,12 +127,12 @@ impl SkillManager {
   }
 
   /// Returns the prompt slice that is loaded into every agent session.
-  fn bootstrap_prompts(&self) -> &[SkillPrompt] {
+  pub(crate) fn bootstrap_prompts(&self) -> &[SkillPrompt] {
     &self.bootstrap
   }
 
   /// Returns the optional catalog prompt, if the manager has additional skills.
-  fn catalog_prompt(&self) -> Option<SkillPrompt> {
+  pub(crate) fn catalog_prompt(&self) -> Option<SkillPrompt> {
     self.catalog.clone()
   }
 
@@ -135,6 +142,7 @@ impl SkillManager {
   ///
   /// Returns [`LoadSkillError`] when the requested skill id does not exist in the
   /// registry.
+  #[cfg_attr(not(test), expect(dead_code))]
   fn load(&self, id: &str) -> Result<SkillPrompt, LoadSkillError> {
     self
       .skills

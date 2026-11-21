@@ -11,7 +11,7 @@ pub mod telemetry;
 
 pub use agent::{
   Agent, AgentBuilder, AgentModel, AgentPlatform, AgentPlatformBuilder,
-  PlatformError, ProviderId, ResolvedModel, Secret, Transport,
+  PlatformError, ProviderId, Secret, Transport,
 };
 pub use identity::{AgentId, SessionId};
 pub use memory::session;

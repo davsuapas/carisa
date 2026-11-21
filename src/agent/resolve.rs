@@ -14,20 +14,7 @@
 //! every agent through this module, so a broken reference fails at startup
 //! rather than on the first call.
 //!
-//! ```rust,no_run
-//! use carisa_core::{AgentBuilder, AgentPlatform};
-//!
-//! # fn example(platform: &AgentPlatform) -> Result<(), carisa_core::PlatformError> {
-//! let agent = AgentBuilder::default()
-//!   .instructions("Answer concisely.".to_owned())
-//!   .build()
-//!   .expect("instructions are set");
-//! let resolved = platform.resolve(&agent)?;
-//!
-//! assert_eq!(resolved.model().id(), "gpt-4o");
-//! # Ok(())
-//! # }
-//! ```
+//! `resolve` is crate-internal so callers cannot bypass platform precedence.
 //!
 //! [`AgentModel::id`]: crate::agent::AgentModel::id
 
@@ -41,7 +28,7 @@ use crate::agent::{
 /// The provider and model are borrowed from the platform; the generation is
 /// owned because it is the result of merging them.
 #[derive(Debug, Clone)]
-pub struct ResolvedModel<'a> {
+pub(super) struct ResolvedModel<'a> {
   provider: &'a Provider,
   model: &'a Model,
   generation: Generation,
@@ -62,17 +49,17 @@ impl<'a> ResolvedModel<'a> {
   }
 
   /// Returns the provider that serves the model.
-  pub const fn provider(&self) -> &'a Provider {
+  pub(super) const fn provider(&self) -> &'a Provider {
     self.provider
   }
 
   /// Returns the resolved model definition.
-  pub const fn model(&self) -> &'a Model {
+  pub(super) const fn model(&self) -> &'a Model {
     self.model
   }
 
   /// Returns the merged generation settings.
-  pub const fn generation(&self) -> &Generation {
+  pub(super) const fn generation(&self) -> &Generation {
     &self.generation
   }
 }
@@ -85,7 +72,8 @@ impl AgentPlatform {
   /// [`PlatformError::Invalid`] when the agent names a model that is not
   /// configured, when no default model exists and the agent names none, or
   /// when the model's provider is not configured.
-  pub fn resolve(
+  #[cfg_attr(not(test), expect(dead_code))]
+  pub(super) fn resolve(
     &self,
     agent: &Agent,
   ) -> Result<ResolvedModel<'_>, PlatformError> {
@@ -93,7 +81,7 @@ impl AgentPlatform {
   }
 
   /// [`Self::resolve`] with the path validation reports on failure.
-  pub(crate) fn resolve_at<'a>(
+  pub(super) fn resolve_at<'a>(
     &'a self,
     agent: &Agent,
     path: &str,

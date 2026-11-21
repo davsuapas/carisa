@@ -35,6 +35,8 @@
 //! middleware observes, it does not re-send. The policy is configuration the
 //! executor's loop consumes.
 
+#![cfg_attr(not(test), expect(dead_code))]
+
 use std::{collections::HashMap, fs, str::FromStr, time::Duration};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -120,7 +122,8 @@ pub(crate) fn validate_headers(
 /// [`PlatformError::Invalid`] when the provider is not configurable by this
 /// build, the credential cannot be resolved, the client cannot be built, or
 /// a header is malformed.
-pub fn completion_model(
+#[expect(dead_code)]
+pub(super) fn completion_model(
   resolved: &ResolvedModel<'_>,
   transport: Option<&Transport>,
 ) -> Result<DynModel<Completion>, PlatformError> {
@@ -176,7 +179,7 @@ fn model_for(
 /// `seed`, and the rest of the portable knobs ride on `GenerationOptions`.
 /// The unsupported-option policy is fixed to `Error`: configuration cannot
 /// downgrade a refusal into a silent drop.
-pub(crate) fn request_for(
+pub(super) fn request_for(
   resolved: &ResolvedModel<'_>,
   prompt: impl Into<Message>,
 ) -> CompletionRequest {
@@ -219,7 +222,7 @@ pub(crate) fn request_for(
 /// # Errors
 ///
 /// [`PlatformError::Invalid`] at `models.<id>.<option>` with rig's reason.
-pub(crate) fn validate_against_catalog(
+pub(super) fn validate_against_catalog(
   resolved: &ResolvedModel<'_>,
 ) -> Result<(), PlatformError> {
   let model_id = resolved.model().id();
